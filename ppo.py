@@ -185,7 +185,6 @@ def main():
 
         metrics.reset()
 
-        # 다음 iteration을 위해 버퍼 초기화
         replay_buffer._init_data()
 
 if __name__=="__main__":
