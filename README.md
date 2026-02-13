@@ -3,6 +3,7 @@ minimal rl implementation using [flax nnx](https://flax.readthedocs.io/en/latest
 
 ## installation
 ```bash
+# python >= 3.12 
 pip install -r requirements.txt
 wandb login # login wandb for logging
 ```
