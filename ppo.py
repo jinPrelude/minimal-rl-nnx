@@ -23,7 +23,6 @@ class ReplayBuffer:
             [], # terminated
         ]
 
-
     def add(self, transition):
         for idx, data in enumerate(transition):
             self.data[idx].append(jnp.array(data))
@@ -38,12 +37,11 @@ class ReplayBuffer:
         terminated = jnp.expand_dims(jnp.stack(self.data[6], 1), -1)
         return obs, actions, a_probs, next_obs, rewards, truncated, terminated
     
-    
 
 class PPO(nnx.Module):
     def __init__(self, *, rngs: nnx.Rngs):
-        self.fc1 = nnx.Linear(4, 256, rngs=rngs)
-        self.fc_pi = nnx.Linear(256, 2, rngs=rngs)
+        self.fc1 = nnx.Linear(8, 256, rngs=rngs)
+        self.fc_pi = nnx.Linear(256, 4, rngs=rngs)
         self.fc_v = nnx.Linear(256, 1, rngs=rngs)
 
     def __call__(self, x):
@@ -69,29 +67,23 @@ def calculate_gae(model, batch, gamma: float = 0.97, lmbda: float = 0.97):
     obs, actions, a_probs, next_obs, rewards, truns, terms = batch
     values = get_value(model, obs)
     next_values = get_value(model, next_obs)
-    td = (rewards + gamma * next_values * (1.0 - terms) - values).squeeze()
-    dones = (truns + terms).squeeze()
-    advantage = 0
-    advantages_list = []
-    for i in reversed(range(td.shape[1])):
-        advantage = gamma * lmbda * advantage * (1.0 - dones[:, i]) + td[:, i]
-        advantages_list.append(advantage)
-    advantages = jnp.expand_dims(jnp.array(advantages_list[::-1]).transpose(), -1)
+    td = (rewards + gamma * next_values * (1.0 - terms) - values).squeeze(-1)
+    dones = (truns + terms).squeeze(-1)
+
+    # [batch, seq_len] -> [seq_len, batch] for scan iter
+    td_t = td.transpose(1, 0)
+    dones_t = dones.transpose(1, 0)
+
+    def scan_step(carry_advantage, inputs):
+        td_step, done_step = inputs
+        advantage = td_step + gamma * lmbda * carry_advantage * (1.0 - done_step)
+        return advantage, advantage
+
+    init_advantage = jnp.zeros(td_t.shape[1], dtype=td.dtype)
+    _, advantages_t = jax.lax.scan(scan_step, init_advantage, (td_t, dones_t), reverse=True)
+    advantages = jnp.expand_dims(advantages_t.transpose(1, 0), -1)
     return *batch, advantages
 
-# def calculate_gae_scan(model, batch, gamma: float = 0.97, lmbda: float = 0.97):
-#     obs, actions, next_obs, rewards, truns, terms = batch # [batch, timestep, 1]
-#     values = get_value(model, obs)
-#     next_values = get_value(model, next_obs)
-#     td = (rewards + gamma * next_values * (1.0 - terms) - values).squeeze()
-
-#     def scan_fn(carry, x):
-#         td, terminal = x
-#         carry = gamma * lmbda * x * carry * (1 - terminal) + td
-#         return carry, carry
-    
-#     carry = 0
-#     xs = 
 
 def loss_fn(model, batch, gamma=.97):
     obs, actions, old_log_probs, next_obs, rewards, truns, terms, advantages = batch
@@ -120,14 +112,12 @@ def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, batch, metrics: nnx.
 
 def parse_arguments():
     parser = ArgumentParser()
-    parser.add_argument("--env-name", type=str, default="CartPole-v1")
-    parser.add_argument("--project", type=str, default="jax-playground")
-    parser.add_argument("--run-name", type=str, default="ppo-cartpole-v1")
+    parser.add_argument("--env-name", type=str, default="LunarLander-v3")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iter", type=int, default=100000)
     parser.add_argument("--num-steps", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-epochs", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-epochs", type=int, default=6)
     parser.add_argument("--gamma", type=float, default=0.97)
     parser.add_argument("--lmbda", type=float, default=0.97)
     parser.add_argument("--learning-rate", type=float, default=0.001)
@@ -135,7 +125,7 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    wandb.init(project=args.project, name=args.run_name, config=vars(args))
+    wandb.init(project="jax-playground", name=f"ppo_{args.env_name}", config=vars(args))
 
     rngs = nnx.Rngs(args.seed)
     ppo = PPO(rngs=rngs)
@@ -147,7 +137,7 @@ def main():
         actor_loss=nnx.metrics.Average("actor_loss")
     )
 
-    envs = gym.make_vec(args.env_name, num_envs=args.batch_size, vectorization_mode='sync')
+    envs = gym.make_vec(args.env_name, num_envs=args.batch_size, vectorization_mode='sync', max_episode_steps=300)
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
     obs, _ = envs.reset()
     global_env_step = 0
