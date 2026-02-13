@@ -70,11 +70,10 @@ def calculate_gae(model, batch, gamma: float = 0.97, lmbda: float = 0.97):
     values = get_value(model, obs)
     next_values = get_value(model, next_obs)
     td = (rewards + gamma * next_values * (1.0 - terms) - values).squeeze(-1)
-    dones = (truns + terms).squeeze(-1)
 
     # [batch, seq_len] -> [seq_len, batch] for scan iter
     td_t = td.transpose(1, 0)
-    dones_t = dones.transpose(1, 0)
+    term_t = terms.squeeze(-1).transpose(1, 0)
 
     def scan_step(carry_advantage, inputs):
         td_step, done_step = inputs
@@ -82,37 +81,36 @@ def calculate_gae(model, batch, gamma: float = 0.97, lmbda: float = 0.97):
         return advantage, advantage
 
     init_advantage = jnp.zeros(td_t.shape[1], dtype=td.dtype)
-    _, advantages_t = jax.lax.scan(scan_step, init_advantage, (td_t, dones_t), reverse=True)
+    _, advantages_t = jax.lax.scan(scan_step, init_advantage, (td_t, term_t), reverse=True)
     advantages = jnp.expand_dims(advantages_t.transpose(1, 0), -1)
-    return *batch, advantages
+    returns = advantages + values
+
+    return *batch, advantages, returns
 
 
-def loss_fn(model, batch, gamma=0.97):
-    obs, actions, old_log_probs, next_obs, rewards, truns, terms, advantages = batch
-    # calculate critic loss
+def loss_fn(model, batch, gamma, clip_eps):
+    obs, actions, old_log_probs, next_obs, rewards, truns, terms, advantages, returns = batch
+
     # logits : [8, 20, 2] actions : [8, 20]
     logits, value = model(obs)
-    next_value = get_value(model, next_obs)
-    target = jax.lax.stop_gradient(rewards + gamma * next_value * (1.0 - terms))
-    critic_loss = optax.huber_loss(value, target)
-    # ratio
+    critic_loss = optax.huber_loss(value, jax.lax.stop_gradient(returns)).mean()
+    
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     log_pi_a = jnp.take_along_axis(log_probs, jnp.expand_dims(actions, -1), axis=-1).squeeze(-1)
     ratio = jnp.exp(log_pi_a - old_log_probs)
-    ratio = ratio.reshape(-1)
-    advantages = advantages.reshape(-1)
-    actor_loss = rlax.clipped_surrogate_pg_loss(ratio, advantages, 0.1)
+    actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
+
     total_loss = actor_loss + 0.5 * critic_loss
-    return total_loss.mean(), (actor_loss.mean(), critic_loss.mean())
+    return total_loss, (actor_loss, critic_loss)
 
 @nnx.jit
-def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics: nnx.metrics.MultiMetric, gamma=0.97):
+def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics: nnx.metrics.MultiMetric, gamma=0.97, clip_eps=0.2):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
     def scan_step(carry, minibatch):
         model, optimizer, metrics = carry
-        (loss, (actor_loss, critic_loss)), grad = grad_fn(model, minibatch, gamma)
+        (loss, (actor_loss, critic_loss)), grad = grad_fn(model, minibatch, gamma, clip_eps)
         optimizer.update(model, grad)
         metrics.update(actor_loss=actor_loss, critic_loss=critic_loss)
         return model, optimizer, metrics
@@ -127,10 +125,11 @@ def parse_arguments():
     parser.add_argument("--num-steps", type=int, default=128)
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--minibatch-size", type=int, default=512)
-    parser.add_argument("--num-epochs", type=int, default=20)
-    parser.add_argument("--gamma", type=float, default=0.97)
+    parser.add_argument("--num-epochs", type=int, default=4)
+    parser.add_argument("--gamma", type=float, default=0.99) # NOTE: gamma was important for training LunarLander. don't decrease gamma below 0.99
     parser.add_argument("--lmbda", type=float, default=0.97)
-    parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument("--learning-rate", type=float, default=0.0005)
+    parser.add_argument("--clip-eps", type=float, default=0.2)
     return parser.parse_args()
 
 def main():
@@ -182,14 +181,18 @@ def main():
         perm = jax.random.permutation(rngs(), total_samples)
         shuffled = jax.tree.map(lambda x: x[perm], flat_batch)
         
-        iter_num = min(args.num_epochs, total_samples // args.minibatch_size)
-        minibatches = jax.tree.map(
-            lambda x: x[:iter_num * args.minibatch_size].reshape(
-                iter_num, args.minibatch_size, *x.shape[1:]
-            ),
-            shuffled
-        )
-        update_ppo(ppo, optimizer, minibatches, metrics, gamma=args.gamma)
+        num_minibatches = total_samples // args.minibatch_size
+        for _ in range(args.num_epochs):
+            perm = jax.random.permutation(rngs(), total_samples)
+            shuffled = jax.tree.map(lambda x: x[perm], flat_batch)
+            minibatches = jax.tree.map(
+                lambda x: x[:num_minibatches * args.minibatch_size].reshape(
+                    num_minibatches, args.minibatch_size, *x.shape[1:]
+                ),
+                shuffled
+            )
+            update_ppo(ppo, optimizer, minibatches, metrics, gamma=args.gamma, clip_eps=args.clip_eps)
+
 
         metric_values = {k: float(v) for k, v in metrics.compute().items()}
 
