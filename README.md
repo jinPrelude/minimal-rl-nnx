@@ -1,5 +1,5 @@
 # minimal_flaxrl
-minimal rl implementation using [flax nnx](https://flax.readthedocs.io/en/latest/index.html)
+minimal rl implementation using [flax nnx](https://flax.readthedocs.io/en/latest/index.html), inspired by [minimal_rl](https://github.com/seungeunrho/minimalRL).
 
 ## installation
 ```bash
@@ -9,7 +9,7 @@ wandb login # login wandb for logging
 ```
 
 ## Train
-### PPO
+### PPO (215 lines)
 ```bash
 python ppo.py
 ```
