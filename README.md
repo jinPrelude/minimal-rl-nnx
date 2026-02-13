@@ -1,15 +1,22 @@
 # minimal_flaxrl
-minimal rl implementation using [flax nnx](https://flax.readthedocs.io/en/latest/index.html), inspired by [minimal_rl](https://github.com/seungeunrho/minimalRL).
 
-## installation
+Minimal RL implementations in [Flax NNX](https://flax.readthedocs.io/en/latest/index.html), inspired by [minimalRL](https://github.com/seungeunrho/minimalRL).
+
+## Quick Start
+
 ```bash
-# python >= 3.12 
-pip install -r requirements.txt
-wandb login # login wandb for logging
+pip install -r requirements.txt   # Python >= 3.12
+wandb login                       # for experiment logging
 ```
 
-## Train
-### PPO (215 lines)
-```bash
-python ppo.py
-```
+## Algorithms
+
+| Algorithm | Lines | Environment | Command |
+|-----------|-------|-------------|---------|
+| PPO | 218 | [LunarLander-v3](https://gymnasium.farama.org/environments/box2d/lunar_lander/) | `python ppo.py` |
+
+### PPO
+
+Solves LunarLander-v3 in ~1 min on MacBook Air M2.
+
+<img src="assets/ppo_lunarlander.png" width="300" />
