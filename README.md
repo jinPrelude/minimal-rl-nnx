@@ -15,6 +15,9 @@ wandb login                       # for experiment logging
 |-----------|-------|-------------|---------|
 | PPO | 218 | [LunarLander-v3](https://gymnasium.farama.org/environments/box2d/lunar_lander/) | `python ppo.py` |
 
+
+If you'd like to see a specific algorithm implemented, feel free to open an [issue](../../issues).
+
 ### PPO
 
 Solves LunarLander-v3 in ~1 min on MacBook Air M2.
