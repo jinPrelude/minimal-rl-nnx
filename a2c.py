@@ -16,7 +16,6 @@ class ReplayBuffer:
         self.data = [
             [], # obs
             [], # actions
-            [], # log_probs
             [], # next_obs
             [], # rewards
             [], # done
@@ -29,14 +28,13 @@ class ReplayBuffer:
     def get(self):
         obs = jnp.stack(self.data[0], 1)
         actions = jnp.stack(self.data[1], 1)
-        a_probs = jnp.stack(self.data[2], 1)
-        next_obs = jnp.stack(self.data[3], 1)
-        rewards = jnp.expand_dims(jnp.stack(self.data[4], 1), -1)
-        done = jnp.expand_dims(jnp.stack(self.data[5], 1), -1)
-        return obs, actions, a_probs, next_obs, rewards, done
-    
+        next_obs = jnp.stack(self.data[2], 1)
+        rewards = jnp.expand_dims(jnp.stack(self.data[3], 1), -1)
+        done = jnp.expand_dims(jnp.stack(self.data[4], 1), -1)
+        return obs, actions, next_obs, rewards, done
 
-class PPO(nnx.Module):
+
+class A2C(nnx.Module):
     def __init__(self, *, rngs: nnx.Rngs):
         self.fc1 = nnx.Linear(8, 256, rngs=rngs)
         self.fc2 = nnx.Linear(256, 256, rngs=rngs)
@@ -53,67 +51,55 @@ class PPO(nnx.Module):
 @nnx.jit
 def sample_action(model, obs, rngs):
     logits, _ = model(obs)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
     actions = rngs.categorical(logits, axis=-1)
-    log_prob = jnp.take_along_axis(log_probs, jnp.expand_dims(actions, -1), axis=-1).squeeze(-1)
-    return log_prob, actions
+    return actions
 
 @nnx.jit
 def get_value(model, obs):
     _, v = model(obs)
     return v
 
-def calculate_gae(model, batch, gamma: float = 0.97, lmbda: float = 0.97):
-    obs, actions, a_probs, next_obs, rewards, done = batch
+def calculate_returns(model, batch, gamma: float = 0.99):
+    obs, actions, next_obs, rewards, done = batch
     values = get_value(model, obs)
-    next_values = get_value(model, next_obs)
-    td = (rewards + gamma * next_values * (1.0 - done) - values).squeeze(-1)
 
-    # [batch, seq_len] -> [seq_len, batch] for scan iter
-    td_t = td.transpose(1, 0)
+    # Bootstrap: V(s_{T+1}) for the last timestep
+    bootstrap_value = get_value(model, next_obs[:, -1]).squeeze(-1)  # [B]
+
+    # [B, T, 1] -> [T, B] for reverse scan
+    rewards_t = rewards.squeeze(-1).transpose(1, 0)
     done_t = done.squeeze(-1).transpose(1, 0)
 
-    def scan_step(carry_advantage, inputs):
-        td_step, done_step = inputs
-        advantage = td_step + gamma * lmbda * carry_advantage * (1.0 - done_step)
-        return advantage, advantage
+    def scan_step(carry_G, inputs):
+        r_t, d_t = inputs
+        G = r_t + gamma * carry_G * (1.0 - d_t)
+        return G, G
 
-    init_advantage = jnp.zeros(td_t.shape[1], dtype=td.dtype)
-    _, advantages_t = jax.lax.scan(scan_step, init_advantage, (td_t, done_t), reverse=True)
-    advantages = jnp.expand_dims(advantages_t.transpose(1, 0), -1)
-    returns = advantages + values
+    _, returns_t = jax.lax.scan(scan_step, bootstrap_value, (rewards_t, done_t), reverse=True)
+    returns = jnp.expand_dims(returns_t.transpose(1, 0), -1)  # [B, T, 1]
+    advantages = returns - values
 
     return *batch, advantages, returns
 
+def loss_fn(model, batch):
+    obs, actions, next_obs, rewards, done, advantages, returns = batch
 
-def loss_fn(model, batch, gamma, clip_eps):
-    obs, actions, old_log_probs, next_obs, rewards, done, advantages, returns = batch
-
-    # logits : [8, 20, 2] actions : [8, 20]
     logits, value = model(obs)
     critic_loss = optax.huber_loss(value, jax.lax.stop_gradient(returns)).mean()
-    
+
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     log_pi_a = jnp.take_along_axis(log_probs, jnp.expand_dims(actions, -1), axis=-1).squeeze(-1)
-    ratio = jnp.exp(log_pi_a - old_log_probs)
-    actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
+    actor_loss = -(log_pi_a * jax.lax.stop_gradient(advantages).squeeze(-1)).mean()
 
     total_loss = actor_loss + 0.5 * critic_loss
     return total_loss, (actor_loss, critic_loss)
 
 @nnx.jit
-def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics: nnx.metrics.MultiMetric, gamma=0.97, clip_eps=0.2):
+def update_a2c(model: nnx.Module, optimizer: nnx.Optimizer, batch, metrics: nnx.metrics.MultiMetric):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-
-    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
-    def scan_step(carry, minibatch):
-        model, optimizer, metrics = carry
-        (loss, (actor_loss, critic_loss)), grad = grad_fn(model, minibatch, gamma, clip_eps)
-        optimizer.update(model, grad)
-        metrics.update(actor_loss=actor_loss, critic_loss=critic_loss)
-        return model, optimizer, metrics
-
-    scan_step((model, optimizer, metrics), minibatches)
+    (loss, (actor_loss, critic_loss)), grad = grad_fn(model, batch)
+    optimizer.update(model, grad)
+    metrics.update(actor_loss=actor_loss, critic_loss=critic_loss)
 
 def parse_arguments():
     parser = ArgumentParser()
@@ -122,26 +108,22 @@ def parse_arguments():
     parser.add_argument("--num-iter", type=int, default=100000)
     parser.add_argument("--num-steps", type=int, default=128)
     parser.add_argument("--num-envs", type=int, default=64)
-    parser.add_argument("--minibatch-size", type=int, default=512)
-    parser.add_argument("--num-epochs", type=int, default=4)
-    parser.add_argument("--gamma", type=float, default=0.99) # NOTE: gamma was important for training LunarLander. don't decrease gamma below 0.99
-    parser.add_argument("--lmbda", type=float, default=0.97)
-    parser.add_argument("--learning-rate", type=float, default=0.0005)
-    parser.add_argument("--clip-eps", type=float, default=0.2)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--learning-rate", type=float, default=0.001)
     return parser.parse_args()
 
 def main():
     args = parse_arguments()
-    wandb.init(project="jax-playground", name=f"ppo_{args.env_name}", config=vars(args))
+    wandb.init(project="jax-playground", name=f"a2c_{args.env_name}", config=vars(args))
 
     rngs = nnx.Rngs(args.seed)
-    ppo = PPO(rngs=rngs)
-    optimizer = nnx.Optimizer(ppo, optax.adamw(args.learning_rate), wrt=nnx.Param)
+    a2c = A2C(rngs=rngs)
+    optimizer = nnx.Optimizer(a2c, optax.adam(args.learning_rate), wrt=nnx.Param)
     replay_buffer = ReplayBuffer()
 
     metrics = nnx.metrics.MultiMetric(
         critic_loss=nnx.metrics.Average("critic_loss"),
-        actor_loss=nnx.metrics.Average("actor_loss")
+        actor_loss=nnx.metrics.Average("actor_loss"),
     )
 
     envs = gym.make_vec(args.env_name, num_envs=args.num_envs, vectorization_mode='sync', max_episode_steps=300)
@@ -153,10 +135,10 @@ def main():
         rollout_lengths = []
 
         for _ in range(args.num_steps):
-            a_probs, sampled_actions = sample_action(ppo, obs, rngs)
+            sampled_actions = sample_action(a2c, obs, rngs)
             next_obs, r, terminated, truncated, info = envs.step(np.asarray(sampled_actions))
             done = np.maximum(truncated, terminated)
-            replay_buffer.add((obs, sampled_actions, a_probs, next_obs, r, done))
+            replay_buffer.add((obs, sampled_actions, next_obs, r, done))
             global_env_step += args.num_envs
 
             if "_episode" in info:
@@ -170,31 +152,13 @@ def main():
             obs = next_obs
 
         batch = replay_buffer.get()
-        batch = calculate_gae(ppo, batch, gamma=args.gamma, lmbda=args.lmbda)
+        batch = calculate_returns(a2c, batch, gamma=args.gamma)
 
         # Flatten: [B, T, ...] -> [B*T, ...]
         flat_batch = jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), batch)
-
-        # Shuffle + minibatch split
-        total_samples = args.num_envs * args.num_steps
-        perm = jax.random.permutation(rngs(), total_samples)
-        shuffled = jax.tree.map(lambda x: x[perm], flat_batch)
-        
-        num_minibatches = total_samples // args.minibatch_size
-        for _ in range(args.num_epochs):
-            perm = jax.random.permutation(rngs(), total_samples)
-            shuffled = jax.tree.map(lambda x: x[perm], flat_batch)
-            minibatches = jax.tree.map(
-                lambda x: x[:num_minibatches * args.minibatch_size].reshape(
-                    num_minibatches, args.minibatch_size, *x.shape[1:]
-                ),
-                shuffled
-            )
-            update_ppo(ppo, optimizer, minibatches, metrics, gamma=args.gamma, clip_eps=args.clip_eps)
-
+        update_a2c(a2c, optimizer, flat_batch, metrics)
 
         metric_values = {k: float(v) for k, v in metrics.compute().items()}
-
 
         wandb_payload = {
             "train/iteration": iteration,
@@ -210,7 +174,6 @@ def main():
         wandb.log(wandb_payload, step=global_env_step)
 
         metrics.reset()
-
         replay_buffer._init_data()
 
 if __name__=="__main__":

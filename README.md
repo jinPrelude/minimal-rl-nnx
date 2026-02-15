@@ -1,6 +1,6 @@
 # minimal_flaxrl
 
-Minimal RL implementations in [Flax NNX](https://flax.readthedocs.io/en/latest/index.html), inspired by [minimalRL](https://github.com/seungeunrho/minimalRL).
+Minimal RL implementations in [Flax NNX](https://flax.readthedocs.io/en/latest/index.html), inspired by [minimalRL](https://github.com/seungeunrho/minimalRL). All trained on [LunarLander-v3](https://gymnasium.farama.org/environments/box2d/lunar_lander/).
 
 ## Quick Start
 
@@ -11,15 +11,20 @@ wandb login                       # for experiment logging
 
 ## Algorithms
 
-| Algorithm | Lines | Environment | Command |
-|-----------|-------|-------------|---------|
-| PPO | 218 | [LunarLander-v3](https://gymnasium.farama.org/environments/box2d/lunar_lander/) | `python ppo.py` |
+| Algorithm | Lines | Command | Training time |
+|-----------|-------|---------|---------------|
+| PPO | 218 | `python ppo.py` | ~40 sec |
+| A2C | 180 | `python a2c.py` | ~100 sec |
 
 
 If you'd like to see a specific algorithm implemented, feel free to open an [issue](../../issues).
 
-### PPO
+## Tuning Tips
 
-Solves LunarLander-v3 in ~1 min on MacBook Air M2.
+- Training failed with `gamma=0.97`. Setting it to `0.99` was critical for learning.
+- Increasing hidden dim from 128 to 256 improved both convergence speed and final performance.
+- For A2C, updating the actor with `V` instead of `G - V` (advantage) caused training to fail.
 
-<img src="assets/ppo_lunarlander.png" width="300" />
+## Performance graph
+
+<img src="assets/performance_graph.png" width="300" />
