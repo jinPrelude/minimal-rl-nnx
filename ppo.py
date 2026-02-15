@@ -132,7 +132,7 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    wandb.init(project="jax-playground", name=f"ppo_{args.env_name}", config=vars(args))
+    wandb.init(project="minimal-flaxrl", name=f"ppo_{args.env_name}", config=vars(args))
 
     rngs = nnx.Rngs(args.seed)
     ppo = PPO(rngs=rngs)

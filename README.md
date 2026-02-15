@@ -15,6 +15,7 @@ wandb login                       # for experiment logging
 |-----------|-------|---------|---------------|
 | [PPO](ppo.py) | 218 | `python ppo.py` | ~40 sec |
 | [A2C](a2c.py) | 180 | `python a2c.py` | ~100 sec |
+| [Impala](impala.py) | 257 | `python impala.py` | ~100 sec |
 
 
 If you'd like to see a specific algorithm implemented, feel free to open an [issue](../../issues).

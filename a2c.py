@@ -114,7 +114,7 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    wandb.init(project="jax-playground", name=f"a2c_{args.env_name}", config=vars(args))
+    wandb.init(project="minimal-flaxrl", name=f"a2c_{args.env_name}", config=vars(args))
 
     rngs = nnx.Rngs(args.seed)
     a2c = A2C(rngs=rngs)
