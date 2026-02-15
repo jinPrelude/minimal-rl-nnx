@@ -11,10 +11,10 @@ wandb login                       # for experiment logging
 
 ## Algorithms
 
-| Algorithm | Lines | Command | Training time |
+| Algorithm | Lines | Command | Training time (MacBook Air M2)|
 |-----------|-------|---------|---------------|
-| PPO | 218 | `python ppo.py` | ~40 sec |
-| A2C | 180 | `python a2c.py` | ~100 sec |
+| [PPO](ppo.py) | 218 | `python ppo.py` | ~40 sec |
+| [A2C](a2c.py) | 180 | `python a2c.py` | ~100 sec |
 
 
 If you'd like to see a specific algorithm implemented, feel free to open an [issue](../../issues).
