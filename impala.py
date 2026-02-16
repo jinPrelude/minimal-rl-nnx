@@ -42,9 +42,7 @@ def rollout(
     args,
     rollout_queue: queue.Queue,
     params_queue: queue.Queue,
-    thread_id: int,
     graphdef,
-    log_to_wandb: bool,
 ):
     envs = gym.vector.SyncVectorEnv(
         [lambda: gym.make("LunarLander-v3", max_episode_steps=300) for _ in range(args.num_envs)]
@@ -69,7 +67,7 @@ def rollout(
     returned_episode_returns = np.zeros(args.num_envs, dtype=np.float32)
     episode_lengths = np.zeros(args.num_envs, dtype=np.float32)
     returned_episode_lengths = np.zeros(args.num_envs, dtype=np.float32)
-    next_obs, _ = envs.reset(seed=args.seed + thread_id)
+    next_obs, _ = envs.reset(seed=args.seed)
     next_reward = np.zeros(args.num_envs, dtype=np.float32)
     next_done = np.zeros(args.num_envs, dtype=np.float32)
 
@@ -85,7 +83,7 @@ def rollout(
             obs = next_obs
             done = next_done
 
-            global_step += args.num_envs * args.num_actor_threads
+            global_step += args.num_envs
 
             obs, action, logits, key = get_action(params, obs, key)
             cpu_action = np.array(action)
@@ -114,14 +112,13 @@ def rollout(
         rollout_queue.put(payload)
         storage = storage[-1:]
 
-        if update % args.log_frequency == 0 and thread_id == 0:
+        if update % args.log_frequency == 0:
             print(f"global_step={global_step}, avg_return={avg_episodic_return:.2f}, max_return={max_episodic_return:.2f}")
-            if log_to_wandb:
-                wandb.log({
-                    "episode/reward_mean": avg_episodic_return,
-                    "episode/reward_max": max_episodic_return,
-                    "episode/length_mean": np.mean(returned_episode_lengths),
-                }, step=global_step)
+            wandb.log({
+                "episode/reward_mean": avg_episodic_return,
+                "episode/reward_max": max_episodic_return,
+                "episode/length_mean": np.mean(returned_episode_lengths),
+            }, step=global_step)
 
 
 def policy_gradient_loss(logits, *args):
@@ -166,7 +163,6 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--total-timesteps", type=int, default=50_000_000)
     parser.add_argument("--num-envs", type=int, default=64)
-    parser.add_argument("--num-actor-threads", type=int, default=1)
     parser.add_argument("--num-steps", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=0.003)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -179,7 +175,7 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    batch_size = args.num_envs * args.num_steps * args.num_actor_threads
+    batch_size = args.num_envs * args.num_steps
     args.num_updates = args.total_timesteps // batch_size
 
     wandb.init(project="minimal-flaxrl", name="impala_LunarLander-v3", config=vars(args))
@@ -195,26 +191,18 @@ def main():
 
     graphdef, _ = nnx.split(agent)
 
-    # Launch actor threads
-    params_queues = []
-    rollout_queues = []
-    for thread_id in range(args.num_actor_threads):
-        pq = queue.Queue(maxsize=1)
-        rq = queue.Queue(maxsize=1)
-        pq.put(nnx.state(agent))
-        params_queues.append(pq)
-        rollout_queues.append(rq)
-        key, thread_key = jax.random.split(key)
-        threading.Thread(
-            target=rollout,
-            args=(thread_key, args, rq, pq, thread_id, graphdef, thread_id == 0),
-            daemon=True,
-        ).start()
+    params_queue = queue.Queue(maxsize=1)
+    rollout_queue = queue.Queue(maxsize=1)
+    params_queue.put(nnx.state(agent))
+    key, thread_key = jax.random.split(key)
+    threading.Thread(
+        target=rollout,
+        args=(thread_key, args, rollout_queue, params_queue, graphdef),
+        daemon=True,
+    ).start()
 
     @nnx.jit
-    def update(agent, optimizer, rollout_data):
-        storage = jax.tree.map(lambda *x: jnp.concatenate(x, axis=1), *rollout_data)
-
+    def update(agent, optimizer, storage):
         def loss_fn(agent):
             return impala_loss(
                 agent, storage.obs, storage.actions, storage.logits,
@@ -229,16 +217,11 @@ def main():
     # Learner loop
     for update_idx in range(1, args.num_updates + 1):
         training_time_start = time.time()
-        rollout_data = []
-        for thread_id in range(args.num_actor_threads):
-            global_step, transition, avg_return = rollout_queues[thread_id].get()
-            rollout_data.append(transition)
+        global_step, storage, _ = rollout_queue.get()
 
-        loss, pg_loss, v_loss, ent_loss = update(agent, optimizer, rollout_data)
+        loss, pg_loss, v_loss, ent_loss = update(agent, optimizer, storage)
 
-        new_params = nnx.state(agent)
-        for pq in params_queues:
-            pq.put(new_params)
+        params_queue.put(nnx.state(agent))
 
         if update_idx % args.log_frequency == 0:
             print(f"update={update_idx}/{args.num_updates}, loss={float(loss):.4f}, training_time={time.time() - training_time_start:.3f}s")
