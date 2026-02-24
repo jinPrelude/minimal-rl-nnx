@@ -1,4 +1,4 @@
-# minimal_flaxrl
+# minimal-rl-nnx
 
 Minimal RL implementations in [Flax NNX](https://flax.readthedocs.io/en/latest/index.html), inspired by [minimalRL](https://github.com/seungeunrho/minimalRL). All trained on [LunarLander-v3](https://gymnasium.farama.org/environments/box2d/lunar_lander/).
 
