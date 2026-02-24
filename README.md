@@ -13,7 +13,8 @@ wandb login                       # for experiment logging
 
 | Algorithm | Lines | Command | Training time (MacBook Air M2)|
 |-----------|-------|---------|---------------|
-| [PPO](ppo.py) | 218 | `python ppo.py` | ~40 sec |
+| [PPO](ppo.py) | 228 | `python ppo.py` | ~40 sec |
+| [PPO_LSTM](ppo_lstm.py) | 278 | `python ppo_lstm.py` | ~5 mins |
 | [A2C](a2c.py) | 180 | `python a2c.py` | ~100 sec |
 | [Impala](impala.py) ([cleanba](https://github.com/vwxyzjn/cleanba) style)| 240 | `python impala.py` | ~100 sec |
 

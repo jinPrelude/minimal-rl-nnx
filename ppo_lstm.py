@@ -41,33 +41,50 @@ class ReplayBuffer:
         )
 
 
-class PPO(nnx.Module):
+class PPOLSTM(nnx.Module):
     def __init__(self, *, rngs: nnx.Rngs):
         self.fc1 = nnx.Linear(8, 256, rngs=rngs)
-        self.fc2 = nnx.Linear(256, 256, rngs=rngs)
+        self.lstm = nnx.LSTMCell(256, 256, rngs=rngs)
         self.fc_pi = nnx.Linear(256, 4, rngs=rngs)
         self.fc_v = nnx.Linear(256, 1, rngs=rngs)
 
-    def __call__(self, x):
-        x = nnx.relu(self.fc1(x))
-        x = nnx.relu(self.fc2(x))
-        logits = self.fc_pi(x)
-        value = self.fc_v(x)
-        return logits, value
+    def init_carry(self, batch_size: int, rngs: nnx.Rngs):
+        return self.lstm.initialize_carry((batch_size, self.lstm.in_features), rngs=rngs)
+
+    def step(self, obs, carry, done):
+        x = nnx.relu(self.fc1(obs))
+
+        mask = (1.0 - done)[..., None]
+        c, h = carry
+        carry = (c * mask, h * mask)
+
+        carry, hidden = self.lstm(carry, x)
+        logits = self.fc_pi(hidden)
+        value = self.fc_v(hidden)
+        return logits, value, carry
+
+    def unroll(self, obs_seq, done_seq, init_carry):
+        def scan_step(carry, inputs):
+            obs_t, done_t = inputs
+            logits, value, carry = self.step(obs_t, carry, done_t)
+            return carry, (logits, value)
+
+        final_carry, (logits, values) = jax.lax.scan(scan_step, init_carry, (obs_seq, done_seq))
+        return logits, values, final_carry
 
 
 @nnx.jit
-def sample_action(model, obs, rngs):
-    logits, value = model(obs)
+def sample_action(model, obs, carry, done, rngs):
+    logits, value, next_carry = model.step(obs, carry, done)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     actions = rngs.categorical(logits, axis=-1)
     sampled_log_prob = jnp.take_along_axis(log_probs, actions[..., None], axis=-1).squeeze(-1)
-    return sampled_log_prob, actions, value.squeeze(-1)
+    return sampled_log_prob, actions, value.squeeze(-1), next_carry
 
 
 @nnx.jit
-def bootstrap_value(model, obs):
-    _, value = model(obs)
+def bootstrap_value(model, obs, carry, done):
+    _, value, _ = model.step(obs, carry, done)
     return value.squeeze(-1)
 
 
@@ -88,9 +105,9 @@ def calculate_gae(rewards, values, dones, next_value, next_done, gamma: float, l
 
 
 def loss_fn(model, batch, clip_eps):
-    obs, actions, old_log_probs, advantages, returns = batch
+    obs, dones, actions, old_log_probs, advantages, returns, init_carry = batch
 
-    logits, values = model(obs)
+    logits, values, _ = model.unroll(obs, dones, init_carry)
     values = values.squeeze(-1)
 
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -119,6 +136,40 @@ def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics
     scan_step((model, optimizer, metrics), minibatches)
 
 
+def make_minibatches(batch, initial_carry, env_indices, envs_per_batch):
+    obs, actions, old_log_probs, rewards, dones, values, advantages, returns = batch
+
+    obs_mb = []
+    dones_mb = []
+    actions_mb = []
+    log_probs_mb = []
+    advantages_mb = []
+    returns_mb = []
+    carry_c_mb = []
+    carry_h_mb = []
+
+    for start in range(0, env_indices.shape[0], envs_per_batch):
+        env_ids = env_indices[start:start + envs_per_batch]
+        obs_mb.append(obs[:, env_ids])
+        dones_mb.append(dones[:, env_ids])
+        actions_mb.append(actions[:, env_ids])
+        log_probs_mb.append(old_log_probs[:, env_ids])
+        advantages_mb.append(advantages[:, env_ids])
+        returns_mb.append(returns[:, env_ids])
+        carry_c_mb.append(initial_carry[0][env_ids])
+        carry_h_mb.append(initial_carry[1][env_ids])
+
+    return (
+        jnp.stack(obs_mb, axis=0),
+        jnp.stack(dones_mb, axis=0),
+        jnp.stack(actions_mb, axis=0),
+        jnp.stack(log_probs_mb, axis=0),
+        jnp.stack(advantages_mb, axis=0),
+        jnp.stack(returns_mb, axis=0),
+        (jnp.stack(carry_c_mb, axis=0), jnp.stack(carry_h_mb, axis=0)),
+    )
+
+
 def parse_arguments():
     parser = ArgumentParser()
     parser.add_argument("--env-name", type=str, default="LunarLander-v3")
@@ -138,10 +189,16 @@ def parse_arguments():
 def main():
     args = parse_arguments()
 
-    wandb.init(project="minimal-flaxrl", name=f"ppo_{args.env_name}", config=vars(args))
+    assert args.minibatch_size % args.num_steps == 0
+    envs_per_batch = args.minibatch_size // args.num_steps
+    assert envs_per_batch >= 1
+    assert args.num_envs % envs_per_batch == 0
+
+
+    wandb.init(project="minimal-flaxrl", name=f"ppo_lstm_{args.env_name}", config=vars(args))
 
     rngs = nnx.Rngs(args.seed)
-    ppo = PPO(rngs=rngs)
+    ppo = PPOLSTM(rngs=rngs)
     optimizer = nnx.Optimizer(ppo, optax.adamw(args.learning_rate), wrt=nnx.Param)
     replay_buffer = ReplayBuffer()
 
@@ -155,14 +212,16 @@ def main():
 
     obs, _ = envs.reset(seed=args.seed)
     done = np.zeros(args.num_envs, dtype=np.float32)
+    carry = ppo.init_carry(args.num_envs, rngs)
 
     global_env_step = 0
     for iteration in range(args.num_iter):
         rollout_rewards = []
         rollout_lengths = []
+        initial_carry = (carry[0], carry[1])
 
         for _ in range(args.num_steps):
-            log_prob, action, value = sample_action(ppo, obs, rngs)
+            log_prob, action, value, carry = sample_action(ppo, obs, carry, done, rngs)
 
             next_obs, reward, terminated, truncated, info = envs.step(np.asarray(action))
             next_done = np.maximum(terminated, truncated).astype(np.float32)
@@ -182,25 +241,16 @@ def main():
         rollout = replay_buffer.get()
         obs_batch, actions_batch, log_probs_batch, rewards_batch, dones_batch, values_batch = rollout
 
-        next_value = bootstrap_value(ppo, obs)
+        next_value = bootstrap_value(ppo, obs, carry, done)
         advantages, returns = calculate_gae(rewards_batch, values_batch, dones_batch, next_value, jnp.array(done), gamma=args.gamma, lmbda=args.lmbda)
 
-        train_batch = (obs_batch, actions_batch, log_probs_batch, advantages, returns)
+        train_batch = (obs_batch, actions_batch, log_probs_batch, rewards_batch, dones_batch, values_batch, advantages, returns)
 
-        # Flatten: [T, B, ...] -> [T*B, ...]
-        flat_batch = jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), train_batch)
-
-        total_samples = args.num_envs * args.num_steps
-        num_minibatches = total_samples // args.minibatch_size
+        num_minibatches = args.num_envs // envs_per_batch
         for _ in range(args.num_epochs):
-            perm = jax.random.permutation(rngs(), total_samples)
-            shuffled = jax.tree.map(lambda x: x[perm], flat_batch)
-            minibatches = jax.tree.map(
-                lambda x: x[:num_minibatches * args.minibatch_size].reshape(
-                    num_minibatches, args.minibatch_size, *x.shape[1:]
-                ),
-                shuffled,
-            )
+            env_indices = np.asarray(jax.random.permutation(rngs(), args.num_envs))
+            env_indices = env_indices[: num_minibatches * envs_per_batch]
+            minibatches = make_minibatches(train_batch, initial_carry, env_indices, envs_per_batch)
             update_ppo(ppo, optimizer, minibatches, metrics, clip_eps=args.clip_eps)
 
         metric_values = {k: float(v) for k, v in metrics.compute().items()}
