@@ -44,6 +44,7 @@ class ReplayBuffer:
 class PPOLSTM(nnx.Module):
     def __init__(self, *, rngs: nnx.Rngs):
         self.fc1 = nnx.Linear(8, 256, rngs=rngs)
+        self.fc2 = nnx.Linear(256, 256, rngs=rngs)
         self.lstm = nnx.LSTMCell(256, 256, rngs=rngs)
         self.fc_pi = nnx.Linear(256, 4, rngs=rngs)
         self.fc_v = nnx.Linear(256, 1, rngs=rngs)
@@ -53,6 +54,7 @@ class PPOLSTM(nnx.Module):
 
     def step(self, obs, carry, done):
         x = nnx.relu(self.fc1(obs))
+        x = nnx.relu(self.fc2(x))
 
         mask = (1.0 - done)[..., None]
         c, h = carry
