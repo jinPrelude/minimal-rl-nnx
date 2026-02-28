@@ -7,13 +7,13 @@ from argparse import ArgumentParser
 from collections import deque
 from typing import List, NamedTuple
 
+import flax.nnx as nnx
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import rlax
-from flax import nnx
 import wandb
 
 
@@ -39,7 +39,7 @@ class Transition(NamedTuple):
 
 
 def rollout(
-    key: jax.random.PRNGKey,
+    key: jax.Array,
     args,
     rollout_queue: queue.Queue,
     params_queue: queue.Queue,
@@ -48,8 +48,6 @@ def rollout(
     envs = gym.vector.SyncVectorEnv(
         [lambda: gym.make("LunarLander-v3", max_episode_steps=300) for _ in range(args.num_envs)]
     )
-    global_step = 0
-    params_queue_get_time = deque(maxlen=10)
 
     @jax.jit
     def get_action(params, obs, key):
@@ -70,11 +68,10 @@ def rollout(
     episode_lengths = np.zeros(args.num_envs, dtype=np.float32)
     returned_episode_lengths = np.zeros(args.num_envs, dtype=np.float32)
     next_obs, _ = envs.reset(seed=args.seed)
-    next_reward = np.zeros(args.num_envs, dtype=np.float32)
     next_done = np.zeros(args.num_envs, dtype=np.float32)
 
     storage = []
-
+    params_queue_get_time = deque(maxlen=10)
     for update in range(1, args.num_updates + 2):
         num_steps_with_bootstrap = args.num_steps + 1 + int(len(storage) == 0)
 
@@ -85,16 +82,16 @@ def rollout(
             jax.block_until_ready(params)
             params_queue_get_time.append(time.time() - params_queue_get_time_start)
 
+        step_increment = 0
         for _ in range(1, num_steps_with_bootstrap):
             obs = next_obs
             done = next_done
-
-            global_step += args.num_envs
+            step_increment += args.num_envs
 
             obs, action, logits, key = get_action(params, obs, key)
-            cpu_action = np.array(action)
+            cpu_action = np.asarray(action)
 
-            next_obs, next_reward_raw, next_term, next_trunc, info = envs.step(cpu_action)
+            next_obs, next_reward_raw, next_term, next_trunc, _ = envs.step(cpu_action)
             next_reward = next_reward_raw.astype(np.float32)
             next_done_bool = next_term | next_trunc
             next_done = next_done_bool.astype(np.float32)
@@ -111,44 +108,33 @@ def rollout(
             returned_episode_lengths = np.where(next_done_bool, episode_lengths, returned_episode_lengths)
             episode_lengths *= 1 - next_done
 
-        avg_episodic_return = np.mean(returned_episode_returns)
-        max_episodic_return = np.max(returned_episode_returns)
-
         payload = (
-            global_step,
-            prepare_data(storage),
-            avg_episodic_return,
+            step_increment,
+            jax.device_get(prepare_data(storage)),
+            float(np.mean(returned_episode_returns)),
+            float(np.max(returned_episode_returns)),
+            float(np.mean(returned_episode_lengths)),
             float(np.mean(params_queue_get_time)),
         )
         rollout_queue.put(payload)
         storage = storage[-1:]
 
-        if update % args.log_frequency == 0:
-            print(f"global_step={global_step}, avg_return={avg_episodic_return:.2f}, max_return={max_episodic_return:.2f}")
-            wandb.log({
-                "episode/reward_mean": avg_episodic_return,
-                "episode/reward_max": max_episodic_return,
-                "episode/length_mean": np.mean(returned_episode_lengths),
-            }, step=global_step)
+    envs.close()
 
 
 def policy_gradient_loss(logits, *args):
-    """rlax.policy_gradient_loss, but with sum(loss) and [T, B, ...] inputs."""
     mean_per_batch = jax.vmap(rlax.policy_gradient_loss, in_axes=1)(logits, *args)
     return jnp.sum(mean_per_batch * logits.shape[0])
 
 
 def entropy_loss_fn(logits, *args):
-    """rlax.entropy_loss, but with sum(loss) and [T, B, ...] inputs."""
     mean_per_batch = jax.vmap(rlax.entropy_loss, in_axes=1)(logits, *args)
     return jnp.sum(mean_per_batch * logits.shape[0])
 
 
 def impala_loss(agent, obs, actions, behavior_logits, rewards, dones, gamma, vf_coef, ent_coef):
-    discounts = (1.0 - dones[1:]) * gamma  # dones[t] is for arriving at t; need dones[t+1] for transition t→t+1
-
+    discounts = (1.0 - dones[1:]) * gamma
     policy_logits, values = agent(obs)
-
     v_tm1, v_t = values[:-1], values[1:]
     policy_logits = policy_logits[:-1]
     behavior_logits = behavior_logits[:-1]
@@ -226,35 +212,46 @@ def main():
         optimizer.update(agent, grads)
         return loss, pg_loss, v_loss, ent_loss, grad_norm
 
-    # Learner loop
+    global_step = 0
     start_time = time.time()
     rollout_queue_get_time = deque(maxlen=10)
     for update_idx in range(1, args.num_updates + 1):
         training_time_start = time.time()
         rollout_queue_get_time_start = time.time()
-        global_step, storage, _, avg_params_queue_get_time = rollout_queue.get()
+        step_increment, storage, avg_return, max_return, avg_length, avg_params_queue_get_time = rollout_queue.get()
         rollout_queue_get_time.append(time.time() - rollout_queue_get_time_start)
 
+        global_step += step_increment
         loss, pg_loss, v_loss, ent_loss, grad_norm = update(agent, optimizer, storage)
 
         params_queue.put(nnx.state(agent))
 
         if update_idx % args.log_frequency == 0:
+            train_time = time.time() - training_time_start
             sps = int(global_step / max(time.time() - start_time, 1e-6))
             avg_rollout_queue_get_time = float(np.mean(rollout_queue_get_time))
-            print(f"update={update_idx}/{args.num_updates}, loss={float(loss):.4f}, training_time={time.time() - training_time_start:.3f}s, sps={sps}")
-            wandb.log({
-                "train/iteration": update_idx,
-                "train/global_env_step": global_step,
-                "train/sps": sps,
-                "train/actor_loss": float(pg_loss),
-                "train/critic_loss": float(v_loss),
-                "train/entropy": float(ent_loss),
-                "train/grad_norm": float(grad_norm),
-                "stats/rollout_queue_get_time": avg_rollout_queue_get_time,
-                "stats/params_queue_get_time": avg_params_queue_get_time,
-                "stats/rollout_params_queue_get_time_diff": avg_rollout_queue_get_time - avg_params_queue_get_time,
-            }, step=global_step)
+
+            print(f"update={update_idx}/{args.num_updates}, " f"loss={float(loss):.4f}, training_time={train_time:.3f}s, sps={sps}")
+            print(f"global_step={global_step}, avg_return={avg_return:.2f}, " f"max_return={max_return:.2f}")
+            wandb.log(
+                {
+                    "train/iteration": update_idx,
+                    "train/global_env_step": global_step,
+                    "train/sps": sps,
+                    "train/actor_loss": float(pg_loss),
+                    "train/critic_loss": float(v_loss),
+                    "train/entropy": float(ent_loss),
+                    "train/loss": float(loss),
+                    "train/grad_norm": float(grad_norm),
+                    "episode/reward_mean": avg_return,
+                    "episode/reward_max": max_return,
+                    "episode/length_mean": avg_length,
+                    "stats/rollout_queue_get_time": avg_rollout_queue_get_time,
+                    "stats/params_queue_get_time": avg_params_queue_get_time,
+                    "stats/rollout_params_queue_get_time_diff": avg_rollout_queue_get_time - avg_params_queue_get_time,
+                },
+                step=global_step,
+            )
 
     wandb.finish()
 
