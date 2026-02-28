@@ -78,10 +78,12 @@ def rollout(
     for update in range(1, args.num_updates + 2):
         num_steps_with_bootstrap = args.num_steps + 1 + int(len(storage) == 0)
 
-        params_queue_get_time_start = time.time()
-        params = params_queue.get()
-        jax.block_until_ready(params)
-        params_queue_get_time.append(time.time() - params_queue_get_time_start)
+        # Skip params fetch at update 2 to overlap rollout with learner update (1-step stale policy).
+        if update != 2:
+            params_queue_get_time_start = time.time()
+            params = params_queue.get()
+            jax.block_until_ready(params)
+            params_queue_get_time.append(time.time() - params_queue_get_time_start)
 
         for _ in range(1, num_steps_with_bootstrap):
             obs = next_obs
