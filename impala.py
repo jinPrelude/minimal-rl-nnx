@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 from argparse import ArgumentParser
+from collections import deque
 from typing import List, NamedTuple
 
 import gymnasium as gym
@@ -48,6 +49,7 @@ def rollout(
         [lambda: gym.make("LunarLander-v3", max_episode_steps=300) for _ in range(args.num_envs)]
     )
     global_step = 0
+    params_queue_get_time = deque(maxlen=10)
 
     @jax.jit
     def get_action(params, obs, key):
@@ -76,8 +78,10 @@ def rollout(
     for update in range(1, args.num_updates + 2):
         num_steps_with_bootstrap = args.num_steps + 1 + int(len(storage) == 0)
 
+        params_queue_get_time_start = time.time()
         params = params_queue.get()
         jax.block_until_ready(params)
+        params_queue_get_time.append(time.time() - params_queue_get_time_start)
 
         for _ in range(1, num_steps_with_bootstrap):
             obs = next_obs
@@ -108,7 +112,12 @@ def rollout(
         avg_episodic_return = np.mean(returned_episode_returns)
         max_episodic_return = np.max(returned_episode_returns)
 
-        payload = (global_step, prepare_data(storage), avg_episodic_return)
+        payload = (
+            global_step,
+            prepare_data(storage),
+            avg_episodic_return,
+            float(np.mean(params_queue_get_time)),
+        )
         rollout_queue.put(payload)
         storage = storage[-1:]
 
@@ -211,26 +220,38 @@ def main():
             )
 
         (loss, (pg_loss, v_loss, ent_loss)), grads = nnx.value_and_grad(loss_fn, has_aux=True)(agent)
+        grad_norm = optax.global_norm(grads)
         optimizer.update(agent, grads)
-        return loss, pg_loss, v_loss, ent_loss
+        return loss, pg_loss, v_loss, ent_loss, grad_norm
 
     # Learner loop
+    start_time = time.time()
+    rollout_queue_get_time = deque(maxlen=10)
     for update_idx in range(1, args.num_updates + 1):
         training_time_start = time.time()
-        global_step, storage, _ = rollout_queue.get()
+        rollout_queue_get_time_start = time.time()
+        global_step, storage, _, avg_params_queue_get_time = rollout_queue.get()
+        rollout_queue_get_time.append(time.time() - rollout_queue_get_time_start)
 
-        loss, pg_loss, v_loss, ent_loss = update(agent, optimizer, storage)
+        loss, pg_loss, v_loss, ent_loss, grad_norm = update(agent, optimizer, storage)
 
         params_queue.put(nnx.state(agent))
 
         if update_idx % args.log_frequency == 0:
-            print(f"update={update_idx}/{args.num_updates}, loss={float(loss):.4f}, training_time={time.time() - training_time_start:.3f}s")
+            sps = int(global_step / max(time.time() - start_time, 1e-6))
+            avg_rollout_queue_get_time = float(np.mean(rollout_queue_get_time))
+            print(f"update={update_idx}/{args.num_updates}, loss={float(loss):.4f}, training_time={time.time() - training_time_start:.3f}s, sps={sps}")
             wandb.log({
                 "train/iteration": update_idx,
                 "train/global_env_step": global_step,
+                "train/sps": sps,
                 "train/actor_loss": float(pg_loss),
                 "train/critic_loss": float(v_loss),
                 "train/entropy": float(ent_loss),
+                "train/grad_norm": float(grad_norm),
+                "stats/rollout_queue_get_time": avg_rollout_queue_get_time,
+                "stats/params_queue_get_time": avg_params_queue_get_time,
+                "stats/rollout_params_queue_get_time_diff": avg_rollout_queue_get_time - avg_params_queue_get_time,
             }, step=global_step)
 
     wandb.finish()
