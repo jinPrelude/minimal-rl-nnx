@@ -20,17 +20,38 @@ import rlax
 import wandb
 
 
-class IMPALAAgent(nnx.Module):
-    def __init__(self, obs_dim: int, action_dim: int, *, rngs: nnx.Rngs):
+class IMPALALSTMAgent(nnx.Module):
+    def __init__(self, obs_dim: int, action_dim: int, lstm_hidden_size: int, *, rngs: nnx.Rngs):
         self.fc1 = nnx.Linear(obs_dim, 256, rngs=rngs)
-        self.fc_pi = nnx.Linear(256, action_dim, rngs=rngs)
-        self.fc_v = nnx.Linear(256, 1, rngs=rngs)
+        self.fc2 = nnx.Linear(256, lstm_hidden_size, rngs=rngs)
+        self.lstm = nnx.LSTMCell(lstm_hidden_size, lstm_hidden_size, rngs=rngs)
+        self.fc_pi = nnx.Linear(lstm_hidden_size, action_dim, rngs=rngs)
+        self.fc_v = nnx.Linear(lstm_hidden_size, 1, rngs=rngs)
 
-    def __call__(self, x):
-        x = nnx.relu(self.fc1(x))
-        logits = self.fc_pi(x)
-        value = self.fc_v(x).squeeze(-1)
-        return logits, value
+    def init_carry(self, batch_size: int, rngs: nnx.Rngs):
+        return self.lstm.initialize_carry((batch_size, self.lstm.in_features), rngs=rngs)
+
+    def step(self, obs, carry, done):
+        x = nnx.relu(self.fc1(obs))
+        x = nnx.relu(self.fc2(x))
+
+        mask = (1.0 - done)[..., None]
+        c, h = carry
+        carry = (c * mask, h * mask)
+
+        carry, hidden = self.lstm(carry, x)
+        logits = self.fc_pi(hidden)
+        value = self.fc_v(hidden).squeeze(-1)
+        return logits, value, carry
+
+    def unroll(self, obs_seq, done_seq, init_carry):
+        def scan_step(carry, inputs):
+            obs_t, done_t = inputs
+            logits_t, value_t, carry = self.step(obs_t, carry, done_t)
+            return carry, (logits_t, value_t)
+
+        final_carry, (logits, values) = jax.lax.scan(scan_step, init_carry, (obs_seq, done_seq))
+        return logits, values, final_carry
 
 
 class Transition(NamedTuple):
@@ -39,6 +60,8 @@ class Transition(NamedTuple):
     actions: list
     logits: list
     rewards: list
+    lstm_c: list
+    lstm_h: list
 
 
 def rollout(
@@ -53,14 +76,15 @@ def rollout(
     )
 
     @jax.jit
-    def get_action(params, obs, key):
-        obs = jnp.array(obs)
+    def get_action(params, obs, carry, done, key):
+        obs = jnp.asarray(obs)
+        done = jnp.asarray(done)
         agent = nnx.merge(graphdef, params)
-        logits, _ = agent(obs)
+        logits, _, next_carry = agent.step(obs, carry, done)
         key, subkey = jax.random.split(key)
         u = jax.random.uniform(subkey, shape=logits.shape)
         action = jnp.argmax(logits - jnp.log(-jnp.log(u)), axis=1)
-        return obs, action, logits, key
+        return obs, action, logits, next_carry, key
 
     @jax.jit
     def prepare_data(storage: List[Transition]) -> Transition:
@@ -72,6 +96,7 @@ def rollout(
     returned_episode_lengths = np.zeros(args.num_envs, dtype=np.float32)
     next_obs, _ = envs.reset(seed=args.seed)
     next_done = np.zeros(args.num_envs, dtype=np.float32)
+    next_carry = None
 
     storage = []
     params_queue_get_time = deque(maxlen=10)
@@ -84,14 +109,18 @@ def rollout(
             params = params_queue.get()
             jax.block_until_ready(params)
             params_queue_get_time.append(time.time() - params_queue_get_time_start)
+            if next_carry is None:
+                agent = nnx.merge(graphdef, params)
+                next_carry = agent.init_carry(args.num_envs, nnx.Rngs(args.seed))
 
         step_increment = 0
         for _ in range(1, num_steps_with_bootstrap):
             obs = next_obs
             done = next_done
+            carry = next_carry
             step_increment += args.num_envs
 
-            obs, action, logits, key = get_action(params, obs, key)
+            obs, action, logits, next_carry, key = get_action(params, obs, carry, done, key)
             cpu_action = np.asarray(action)
 
             next_obs, next_reward_raw, next_term, next_trunc, _ = envs.step(cpu_action)
@@ -102,6 +131,7 @@ def rollout(
             storage.append(Transition(
                 obs=obs, dones=done, actions=action, logits=logits,
                 rewards=next_reward,
+                lstm_c=carry[0], lstm_h=carry[1],
             ))
 
             episode_returns += next_reward
@@ -135,9 +165,9 @@ def entropy_loss_fn(logits, *args):
     return jnp.sum(mean_per_batch * logits.shape[0])
 
 
-def impala_loss(agent, obs, actions, behavior_logits, rewards, dones, gamma, vf_coef, ent_coef):
+def impala_loss(agent, obs, actions, behavior_logits, rewards, dones, init_carry, gamma, vf_coef, ent_coef):
     discounts = (1.0 - dones[1:]) * gamma
-    policy_logits, values = agent(obs)
+    policy_logits, values, _ = agent.unroll(obs, dones, init_carry)
     v_tm1, v_t = values[:-1], values[1:]
     policy_logits = policy_logits[:-1]
     behavior_logits = behavior_logits[:-1]
@@ -163,13 +193,14 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--total-timesteps", type=int, default=50_000_000)
     parser.add_argument("--num-envs", type=int, default=64)
-    parser.add_argument("--num-steps", type=int, default=128)
-    parser.add_argument("--learning-rate", type=float, default=0.003)
+    parser.add_argument("--num-steps", type=int, default=64)
+    parser.add_argument("--lstm-hidden-size", type=int, default=256)
+    parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=40.0)
-    parser.add_argument("--log-frequency", type=int, default=10)
+    parser.add_argument("--log-frequency", type=int, default=1)
     return parser.parse_args()
 
 
@@ -178,12 +209,12 @@ def main():
     batch_size = args.num_envs * args.num_steps
     args.num_updates = args.total_timesteps // batch_size
 
-    wandb.init(project="minimal-flaxrl", name="impala_LunarLander-v3", config=vars(args))
+    wandb.init(project="minimal-flaxrl", name="impala_lstm_LunarLander-v3", config=vars(args))
 
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
 
-    agent = IMPALAAgent(obs_dim=8, action_dim=4, rngs=nnx.Rngs(args.seed))
+    agent = IMPALALSTMAgent(obs_dim=8, action_dim=4, lstm_hidden_size=args.lstm_hidden_size, rngs=nnx.Rngs(args.seed))
     optimizer = nnx.Optimizer(agent, optax.chain(
         optax.clip_by_global_norm(args.max_grad_norm),
         optax.rmsprop(learning_rate=args.learning_rate, decay=0.99, eps=0.01),
@@ -206,7 +237,7 @@ def main():
         def loss_fn(agent):
             return impala_loss(
                 agent, storage.obs, storage.actions, storage.logits,
-                storage.rewards, storage.dones,
+                storage.rewards, storage.dones, (storage.lstm_c[0], storage.lstm_h[0]),
                 args.gamma, args.vf_coef, args.ent_coef,
             )
 

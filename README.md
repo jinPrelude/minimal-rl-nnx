@@ -19,6 +19,7 @@ wandb login                       # for experiment logging
 | [PPO_GTrXL](ppo_gtrxl.py) | 456 | `python ppo_gtrxl.py` | 1+ hour (recommend GPU training) |
 | [A2C](a2c.py) | 180 | `python a2c.py` | ~100 sec |
 | [Impala](impala.py) ([cleanba](https://github.com/vwxyzjn/cleanba) style)| 263 | `python impala.py` | ~100 sec |
+| [Impala_LSTM](impala_lstm.py) | 294 | `python impala_lstm.py` | |
 
 
 If you'd like to see a specific algorithm implemented, feel free to open an [issue](../../issues).
