@@ -1,6 +1,6 @@
 gymnasium >= 1.0.0
 numpy >= 2.0.0
-flax == 0.12.3
+flax == 0.12.4
 jax == 0.9.0
 optax == 0.2.6
 rlax == 0.1.8

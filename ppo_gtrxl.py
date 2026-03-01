@@ -101,16 +101,21 @@ class GTrXLBlock(nnx.Module):
         self.gate_ffn = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
 
     def __call__(self, memory, query, memory_mask):
-        normed = self.norm_attn(jnp.concatenate([memory, query], axis=1))
-        memory_len = memory.shape[1]
-        mem_norm = normed[:, :memory_len, :]
-        q_norm = normed[:, memory_len:, :]
+        if memory_mask.ndim == 2:
+            attn_mask = memory_mask[:, None, None, :]
+        elif memory_mask.ndim == 3:
+            attn_mask = memory_mask[:, None, :, :]
+        else:
+            raise ValueError(f"memory_mask must be rank-2 or rank-3, got {memory_mask.ndim}")
+
+        mem_norm = self.norm_attn(memory)
+        q_norm = self.norm_attn(query)
 
         attn_out = self.attention(
             q_norm,
             mem_norm,
             mem_norm,
-            mask=memory_mask[:, None, :, :],
+            mask=attn_mask,
             deterministic=True,
         )
         x = self.gate_attn(query, nnx.relu(attn_out))
@@ -167,14 +172,20 @@ class PPOGTrXL(nnx.Module):
         sinusoid = clipped[..., None] * self.inv_freq[None, :]
         return jnp.concatenate([jnp.sin(sinusoid), jnp.cos(sinusoid)], axis=-1)
 
-    @staticmethod
-    def _reset_state_on_done(state: TrXLState, done):
-        mask_float = 1.0 - done
-        mask_int = 1 - done.astype(jnp.int32)
-        return TrXLState(
-            memory=state.memory * mask_float[:, None, None, None],
-            valid_len=state.valid_len * mask_int,
-            pos=state.pos * mask_int,
+    def _build_unroll_attn_mask(self, valid_len, num_steps: int):
+        query_idx = jnp.arange(num_steps, dtype=jnp.int32)[None, :]
+        memory_idx = jnp.arange(self.memory_len, dtype=jnp.int32)[None, :]
+        key_idx = jnp.arange(self.memory_len + num_steps, dtype=jnp.int32)[None, :]
+
+        memory_valid = memory_idx >= (self.memory_len - valid_len[:, None])
+        query_valid = jnp.ones((valid_len.shape[0], num_steps), dtype=jnp.bool_)
+        key_valid = jnp.concatenate([memory_valid, query_valid], axis=1)
+
+        query_key_idx = self.memory_len + query_idx
+        return (
+            key_valid[:, None, :]
+            & (key_idx[:, None, :] < query_key_idx[:, :, None])
+            & (key_idx[:, None, :] >= (query_key_idx - self.memory_len)[:, :, None])
         )
 
     def _trxl_step(self, state: TrXLState, x_t):
@@ -186,8 +197,8 @@ class PPOGTrXL(nnx.Module):
         x = x_t
         layer_tokens = []
         for i, layer in enumerate(self.layers):
-            layer_tokens.append(jax.lax.stop_gradient(x))
-            x = layer(memories[:, :, i], x[:, None, :], memory_mask[:, None, :])
+            layer_tokens.append(x)
+            x = layer(memories[:, :, i], x[:, None, :], memory_mask)
             x = x.squeeze(1)
 
         new_tokens = jnp.stack(layer_tokens, axis=1)
@@ -200,8 +211,8 @@ class PPOGTrXL(nnx.Module):
         return new_state, x
 
     def step(self, obs, state: TrXLState, done):
+        del done
         x = self._encode(obs)
-        state = self._reset_state_on_done(state, done)
         state, hidden = self._trxl_step(state, x)
         hidden = nnx.relu(self.hidden_post_trxl(hidden))
         logits = self.fc_pi(hidden)
@@ -209,18 +220,49 @@ class PPOGTrXL(nnx.Module):
         return logits, value, state
 
     def unroll(self, obs_seq, done_seq, init_state: TrXLState):
-        x_seq = self._encode(obs_seq)
+        del done_seq
+        x = jnp.swapaxes(self._encode(obs_seq), 0, 1)
 
-        def scan_step(state, inputs):
-            x_t, done_t = inputs
-            state = self._reset_state_on_done(state, done_t)
-            state, hidden = self._trxl_step(state, x_t)
-            return state, hidden
+        num_steps = x.shape[1]
+        time_idx = jnp.arange(num_steps, dtype=jnp.int32)[None, :]
+        memory_idx = jnp.arange(self.memory_len, dtype=jnp.int32)[None, :]
+        query_pos = init_state.pos[:, None] + time_idx
 
-        final_state, hidden_seq = jax.lax.scan(scan_step, init_state, (x_seq, done_seq))
-        hidden_seq = nnx.relu(self.hidden_post_trxl(hidden_seq))
-        logits = self.fc_pi(hidden_seq)
-        values = self.fc_v(hidden_seq).squeeze(-1)
+        memory_pos = init_state.pos[:, None] + memory_idx - self.memory_len
+        attn_mask = self._build_unroll_attn_mask(init_state.valid_len, num_steps)
+
+        memory_pos_emb = self._position_embedding(memory_pos)
+        query_pos_emb = self._position_embedding(query_pos)
+
+        layer_inputs = []
+        for i, layer in enumerate(self.layers):
+            layer_inputs.append(x)
+            kv = jnp.concatenate(
+                [
+                    init_state.memory[:, :, i] + memory_pos_emb,
+                    x + query_pos_emb,
+                ],
+                axis=1,
+            )
+            x = layer(kv, x, attn_mask)
+
+        hidden_seq = nnx.relu(self.hidden_post_trxl(x))
+        logits = jnp.swapaxes(self.fc_pi(hidden_seq), 0, 1)
+        values = jnp.swapaxes(self.fc_v(hidden_seq).squeeze(-1), 0, 1)
+
+        final_pos = init_state.pos + num_steps
+        final_valid_len = jnp.minimum(init_state.valid_len + num_steps, self.memory_len)
+
+        final_layers = []
+        for i in range(self.n_layers):
+            tokens = jnp.concatenate([init_state.memory[:, :, i], layer_inputs[i]], axis=1)
+            final_layers.append(tokens[:, -self.memory_len :, :])
+
+        final_state = TrXLState(
+            memory=jnp.stack(final_layers, axis=2),
+            valid_len=final_valid_len,
+            pos=final_pos,
+        )
         return logits, values, final_state
 
 
@@ -258,7 +300,7 @@ def calculate_gae(rewards, values, dones, next_value, next_done, gamma: float, l
 def loss_fn(model, batch, clip_eps):
     obs, dones, actions, old_log_probs, advantages, returns, init_state = batch
 
-    logits, values, _ = model.unroll(obs, dones, init_state)
+    logits, values, final_state = model.unroll(obs, dones, init_state)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     selected_log_probs = jnp.take_along_axis(log_probs, actions[..., None], axis=-1).squeeze(-1)
 
@@ -266,7 +308,7 @@ def loss_fn(model, batch, clip_eps):
     actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
     critic_loss = optax.huber_loss(values, jax.lax.stop_gradient(returns)).mean()
     total_loss = actor_loss + 0.5 * critic_loss
-    return total_loss, (actor_loss, critic_loss)
+    return total_loss, (actor_loss, critic_loss, final_state)
 
 
 @nnx.jit
@@ -276,20 +318,50 @@ def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
     def scan_step(carry, minibatch):
         model, optimizer, metrics = carry
-        (_, (actor_loss, critic_loss)), grad = grad_fn(model, minibatch, clip_eps)
-        optimizer.update(model, grad)
-        metrics.update(actor_loss=actor_loss, critic_loss=critic_loss)
+        obs_segments, dones_segments, actions_segments, old_log_probs_segments, advantages_segments, returns_segments, init_state = minibatch
+
+        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+        def segment_step(seg_carry, segment):
+            model, optimizer, metrics, state = seg_carry
+            obs, dones, actions, old_log_probs, advantages, returns = segment
+            (_, (actor_loss, critic_loss, final_state)), grad = grad_fn(
+                model,
+                (obs, dones, actions, old_log_probs, advantages, returns, state),
+                clip_eps,
+            )
+            optimizer.update(model, grad)
+            metrics.update(actor_loss=actor_loss, critic_loss=critic_loss)
+            next_state = TrXLState(
+                memory=jax.lax.stop_gradient(final_state.memory),
+                valid_len=jax.lax.stop_gradient(final_state.valid_len),
+                pos=jax.lax.stop_gradient(final_state.pos),
+            )
+            return model, optimizer, metrics, next_state
+
+        model, optimizer, metrics, _ = segment_step(
+            (model, optimizer, metrics, init_state),
+            (
+                obs_segments,
+                dones_segments,
+                actions_segments,
+                old_log_probs_segments,
+                advantages_segments,
+                returns_segments,
+            ),
+        )
         return model, optimizer, metrics
 
     scan_step((model, optimizer, metrics), minibatches)
 
 
-def make_minibatches(batch, initial_state: TrXLState, env_indices, envs_per_batch: int):
+def make_minibatches(batch, initial_state: TrXLState, env_indices, envs_per_batch: int, segment_length: int):
     obs, actions, old_log_probs, _rewards, dones, _values, advantages, returns = batch
+    num_segments = obs.shape[0] // segment_length
     env_ids = jnp.asarray(env_indices, dtype=jnp.int32).reshape(-1, envs_per_batch)
 
     def select_time_env(x):
-        return jnp.swapaxes(jnp.take(x, env_ids, axis=1), 0, 1)
+        selected = jnp.swapaxes(jnp.take(x, env_ids, axis=1), 0, 1)
+        return selected.reshape(selected.shape[0], num_segments, segment_length, *selected.shape[2:])
 
     return (
         select_time_env(obs),
@@ -312,6 +384,7 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iter", type=int, default=100000)
     parser.add_argument("--num-steps", type=int, default=128)
+    parser.add_argument("--segment-length", type=int, default=32)
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--num-minibatch", type=int, default=2)
     parser.add_argument("--num-epochs", type=int, default=3)
@@ -334,6 +407,8 @@ def main():
     assert args.num_minibatch >= 1
     assert args.num_envs % args.num_minibatch == 0
     envs_per_batch = args.num_envs // args.num_minibatch
+    assert args.segment_length > 0
+    assert args.num_steps % args.segment_length == 0
     assert args.trxl_dim % args.trxl_num_heads == 0
     assert args.trxl_memory_length > 0
 
@@ -428,7 +503,7 @@ def main():
         for _ in range(args.num_epochs):
             env_indices = np.asarray(jax.random.permutation(rngs(), args.num_envs))
             env_indices = env_indices[: num_minibatches * envs_per_batch]
-            minibatches = make_minibatches(train_batch, initial_state, env_indices, envs_per_batch)
+            minibatches = make_minibatches(train_batch, initial_state, env_indices, envs_per_batch, args.segment_length)
             update_ppo(ppo, optimizer, minibatches, metrics, clip_eps=args.clip_eps)
 
         metric_values = {k: float(v) for k, v in metrics.compute().items()}

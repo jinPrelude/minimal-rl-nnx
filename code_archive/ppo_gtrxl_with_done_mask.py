@@ -60,10 +60,31 @@ class TrXLState(struct.PyTreeNode):
     pos: jax.Array
 
 
-class TrXLBlock(nnx.Module):
-    def __init__(self, dim: int, num_heads: int, *, rngs: nnx.Rngs):
-        self.query_norm = nnx.LayerNorm(num_features=dim, rngs=rngs)
-        self.memory_norm = nnx.LayerNorm(num_features=dim, rngs=rngs)
+class GRUGate(nnx.Module):
+    def __init__(self, dim: int, bias_init: float = 2.0, *, rngs: nnx.Rngs):
+        self.w_r = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
+        self.u_r = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
+        self.w_z = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
+        self.u_z = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
+        self.w_g = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
+        self.u_g = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
+        self.b_g = nnx.Param(jnp.full((dim,), bias_init, dtype=jnp.float32))
+
+    def __call__(self, x, y):
+        r = jax.nn.sigmoid(self.w_r(y) + self.u_r(x))
+        z = jax.nn.sigmoid(self.w_z(y) + self.u_z(x) - self.b_g[...])
+        h_hat = jnp.tanh(self.w_g(y) + self.u_g(r * x))
+        return (1.0 - z) * x + z * h_hat
+
+
+class GTrXLBlock(nnx.Module):
+    def __init__(self, dim: int, num_heads: int, gate_bias_init: float, *, rngs: nnx.Rngs):
+        if dim % num_heads != 0:
+            raise ValueError(f"dim must be divisible by num_heads, got dim={dim}, num_heads={num_heads}")
+
+        self.norm_attn = nnx.LayerNorm(num_features=dim, rngs=rngs)
+        self.norm_ffn = nnx.LayerNorm(num_features=dim, rngs=rngs)
+
         self.attention = nnx.MultiHeadAttention(
             num_heads=num_heads,
             in_features=dim,
@@ -71,10 +92,13 @@ class TrXLBlock(nnx.Module):
             out_features=dim,
             dropout_rate=0.0,
             decode=False,
+            use_bias=False,
             rngs=rngs,
         )
-        self.ffn_norm = nnx.LayerNorm(num_features=dim, rngs=rngs)
-        self.ffn = nnx.Linear(dim, dim, rngs=rngs)
+        self.fc = nnx.Linear(dim, dim, rngs=rngs)
+
+        self.gate_attn = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
+        self.gate_ffn = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
 
     def __call__(self, memory, query, memory_mask):
         if memory_mask.ndim == 2:
@@ -84,21 +108,24 @@ class TrXLBlock(nnx.Module):
         else:
             raise ValueError(f"memory_mask must be rank-2 or rank-3, got {memory_mask.ndim}")
 
-        q = self.query_norm(query)
-        kv = self.memory_norm(memory)
+        mem_norm = self.norm_attn(memory)
+        q_norm = self.norm_attn(query)
+
         attn_out = self.attention(
-            q,
-            kv,
-            kv,
+            q_norm,
+            mem_norm,
+            mem_norm,
             mask=attn_mask,
             deterministic=True,
         )
-        x = query + attn_out
-        y = self.ffn(nnx.relu(self.ffn_norm(x)))
-        return x + y
+        x = self.gate_attn(query, nnx.relu(attn_out))
+
+        ffn_out = self.fc(self.norm_ffn(x))
+        x = self.gate_ffn(x, nnx.relu(ffn_out))
+        return x
 
 
-class PPOTrXL(nnx.Module):
+class PPOGTrXL(nnx.Module):
     def __init__(
         self,
         obs_dim: int,
@@ -107,6 +134,7 @@ class PPOTrXL(nnx.Module):
         trxl_num_layers: int,
         trxl_num_heads: int,
         trxl_memory_length: int,
+        gtrxl_gate_bias_init: float,
         *,
         rngs: nnx.Rngs,
     ):
@@ -118,7 +146,10 @@ class PPOTrXL(nnx.Module):
         self.memory_len = trxl_memory_length
 
         self.fc_encoder = nnx.Linear(obs_dim, trxl_dim, rngs=rngs)
-        self.layers = nnx.List([TrXLBlock(trxl_dim, trxl_num_heads, rngs=rngs) for _ in range(trxl_num_layers)])
+        self.layers = nnx.List([
+            GTrXLBlock(trxl_dim, trxl_num_heads, gtrxl_gate_bias_init, rngs=rngs)
+            for _ in range(trxl_num_layers)
+        ])
         self.hidden_post_trxl = nnx.Linear(trxl_dim, trxl_dim, rngs=rngs)
         self.fc_pi = nnx.Linear(trxl_dim, num_actions, rngs=rngs)
         self.fc_v = nnx.Linear(trxl_dim, 1, rngs=rngs)
@@ -141,20 +172,14 @@ class PPOTrXL(nnx.Module):
         sinusoid = clipped[..., None] * self.inv_freq[None, :]
         return jnp.concatenate([jnp.sin(sinusoid), jnp.cos(sinusoid)], axis=-1)
 
-    def _build_unroll_attn_mask(self, valid_len, num_steps: int):
-        query_idx = jnp.arange(num_steps, dtype=jnp.int32)[None, :]
-        memory_idx = jnp.arange(self.memory_len, dtype=jnp.int32)[None, :]
-        key_idx = jnp.arange(self.memory_len + num_steps, dtype=jnp.int32)[None, :]
-
-        memory_valid = memory_idx >= (self.memory_len - valid_len[:, None])
-        query_valid = jnp.ones((valid_len.shape[0], num_steps), dtype=jnp.bool_)
-        key_valid = jnp.concatenate([memory_valid, query_valid], axis=1)
-
-        query_key_idx = self.memory_len + query_idx
-        return (
-            key_valid[:, None, :]
-            & (key_idx[:, None, :] < query_key_idx[:, :, None])
-            & (key_idx[:, None, :] >= (query_key_idx - self.memory_len)[:, :, None])
+    @staticmethod
+    def _reset_state_on_done(state: TrXLState, done):
+        mask_float = 1.0 - done
+        mask_int = 1 - done.astype(jnp.int32)
+        return TrXLState(
+            memory=state.memory * mask_float[:, None, None, None],
+            valid_len=state.valid_len * mask_int,
+            pos=state.pos * mask_int,
         )
 
     def _trxl_step(self, state: TrXLState, x_t):
@@ -180,55 +205,103 @@ class PPOTrXL(nnx.Module):
         return new_state, x
 
     def step(self, obs, state: TrXLState, done):
-        del done
         x = self._encode(obs)
+        state = self._reset_state_on_done(state, done)
         state, hidden = self._trxl_step(state, x)
         hidden = nnx.relu(self.hidden_post_trxl(hidden))
         logits = self.fc_pi(hidden)
         value = self.fc_v(hidden).squeeze(-1)
         return logits, value, state
 
+    def _unroll_metadata(self, done, init_state: TrXLState):
+        # done: [B, T]   (whether reset is needed before seeing obs_t)
+        B, T = done.shape
+        M = self.memory_len
+
+        t = jnp.arange(T, dtype=jnp.int32)[None, :]   # [1, T]
+        m = jnp.arange(M, dtype=jnp.int32)[None, :]   # [1, M]
+
+        # episode id: increments whenever a reset occurs
+        episode = jnp.cumsum(done, axis=1)  # [B, T]
+
+        # "most recent reset index" at each timestep
+        last_reset = jnp.maximum.accumulate(jnp.where(done == 1, t, -jnp.ones_like(t)), axis=1)  # [B, T]
+
+        # query position: continues from init_state.pos before reset,
+        # and restarts from 0 after reset
+        query_pos = jnp.where(
+            episode == 0,
+            init_state.pos[:, None] + t,
+            t - last_reset,
+        )  # [B, T]
+
+        # init memory is right-aligned
+        mem_valid = m >= (M - init_state.valid_len[:, None])  # [B, M]
+        mem_pos = init_state.pos[:, None] + m - M             # [B, M]
+
+        # send invalid memory to episode=-1 so it is automatically excluded by the mask
+        key_episode = jnp.concatenate([jnp.where(mem_valid, 0, -1), episode], axis=1)  # [B, M+T]
+        key_pos = jnp.concatenate([jnp.where(mem_valid, mem_pos, -M - 1), query_pos], axis=1)  # [B, M+T]
+
+        # query can only attend to the past M tokens in the same episode
+        attn_mask = (
+            (key_episode[:, None, :] == episode[:, :, None]) &
+            (key_pos[:, None, :] < query_pos[:, :, None]) &
+            (key_pos[:, None, :] >= query_pos[:, :, None] - M)
+        )  # [B, T, M+T]
+
+        # final memory length that remains after rollout ends
+        final_valid_len = jnp.where(
+            episode[:, -1] == 0,
+            init_state.valid_len + T,   # if no reset during rollout, previous memory is kept
+            T - last_reset[:, -1],      # only tokens after the last reset remain
+        )
+        final_valid_len = jnp.minimum(final_valid_len, M)
+        final_pos = query_pos[:, -1] + 1
+
+        return mem_pos, query_pos, attn_mask, final_valid_len, final_pos
+
     def unroll(self, obs_seq, done_seq, init_state: TrXLState):
-        del done_seq
-        x = jnp.swapaxes(self._encode(obs_seq), 0, 1)
+        # obs_seq:  [T, B, obs_dim]
+        # done_seq: [T, B]
+        x = jnp.swapaxes(self._encode(obs_seq), 0, 1)  # [B, T, D]
+        done = jnp.swapaxes(jnp.asarray(done_seq, dtype=jnp.int32), 0, 1)  # [B, T]
 
-        num_steps = x.shape[1]
-        time_idx = jnp.arange(num_steps, dtype=jnp.int32)[None, :]
-        memory_idx = jnp.arange(self.memory_len, dtype=jnp.int32)[None, :]
-        query_pos = init_state.pos[:, None] + time_idx
+        mem_pos, query_pos, attn_mask, final_valid_len, final_pos = self._unroll_metadata(done, init_state)
 
-        memory_pos = init_state.pos[:, None] + memory_idx - self.memory_len
-        attn_mask = self._build_unroll_attn_mask(init_state.valid_len, num_steps)
-
-        memory_pos_emb = self._position_embedding(memory_pos)
-        query_pos_emb = self._position_embedding(query_pos)
+        mem_pos_emb = self._position_embedding(mem_pos)      # [B, M, D]
+        query_pos_emb = self._position_embedding(query_pos)  # [B, T, D]
 
         layer_inputs = []
         for i, layer in enumerate(self.layers):
-            layer_inputs.append(x)
+            layer_inputs.append(x)  # token to store as same-layer memory
+
             kv = jnp.concatenate(
                 [
-                    init_state.memory[:, :, i] + memory_pos_emb,
-                    x + query_pos_emb,
+                    init_state.memory[:, :, i] + mem_pos_emb,  # previous memory
+                    x + query_pos_emb,                         # current rollout prefix
                 ],
                 axis=1,
-            )
-            x = layer(kv, x, attn_mask)
+            )  # [B, M+T, D]
 
-        hidden_seq = nnx.relu(self.hidden_post_trxl(x))
-        logits = jnp.swapaxes(self.fc_pi(hidden_seq), 0, 1)
-        values = jnp.swapaxes(self.fc_v(hidden_seq).squeeze(-1), 0, 1)
+            x = layer(kv, x, attn_mask)  # [B, T, D]
 
-        final_pos = init_state.pos + num_steps
-        final_valid_len = jnp.minimum(init_state.valid_len + num_steps, self.memory_len)
+        hidden = nnx.relu(self.hidden_post_trxl(x))
+        logits = jnp.swapaxes(self.fc_pi(hidden), 0, 1)                  # [T, B, A]
+        values = jnp.swapaxes(self.fc_v(hidden).squeeze(-1), 0, 1)       # [T, B]
 
-        final_layers = []
-        for i in range(self.n_layers):
-            tokens = jnp.concatenate([init_state.memory[:, :, i], layer_inputs[i]], axis=1)
-            final_layers.append(tokens[:, -self.memory_len :, :])
+        # final memory is always a suffix of [init_memory, rollout_tokens]
+        layer_inputs = jnp.stack(layer_inputs, axis=2)  # [B, T, L, D]
+        history = jnp.concatenate([init_state.memory, layer_inputs], axis=1)  # [B, M+T, L, D]
+        tail = history[:, -self.memory_len :]  # [B, M, L, D]
+
+        tail_mask = (
+            jnp.arange(self.memory_len, dtype=jnp.int32)[None, :]
+            >= (self.memory_len - final_valid_len[:, None])
+        )  # [B, M]
 
         final_state = TrXLState(
-            memory=jnp.stack(final_layers, axis=2),
+            memory=jnp.where(tail_mask[:, :, None, None], tail, jnp.zeros_like(tail)),
             valid_len=final_valid_len,
             pos=final_pos,
         )
@@ -365,6 +438,7 @@ def parse_arguments():
     parser.add_argument("--trxl-num-layers", type=int, default=3)
     parser.add_argument("--trxl-num-heads", type=int, default=2)
     parser.add_argument("--trxl-memory-length", type=int, default=64)
+    parser.add_argument("--gtrxl-gate-bias-init", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -385,18 +459,19 @@ def main():
 
     wandb.init(
         project="minimal-flaxrl",
-        name=f"ppo_trxl_{args.env_name}",
+        name=f"ppo_gtrxl_{args.env_name}",
         config={**vars(args), "trxl_memory_length": memory_length},
     )
 
     rngs = nnx.Rngs(args.seed)
-    ppo = PPOTrXL(
+    ppo = PPOGTrXL(
         obs_dim=8,
         num_actions=4,
         trxl_dim=args.trxl_dim,
         trxl_num_layers=args.trxl_num_layers,
         trxl_num_heads=args.trxl_num_heads,
         trxl_memory_length=memory_length,
+        gtrxl_gate_bias_init=args.gtrxl_gate_bias_init,
         rngs=rngs,
     )
     optimizer = nnx.Optimizer(ppo, optax.adamw(args.learning_rate), wrt=nnx.Param)
