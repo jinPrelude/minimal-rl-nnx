@@ -1,9 +1,12 @@
+import os
 from argparse import ArgumentParser
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import flax.nnx as nnx
 import gymnasium as gym
 import jax
-from jax import numpy as jnp
+import jax.numpy as jnp
 import numpy as np
 import optax
 import rlax
@@ -11,33 +14,42 @@ import wandb
 
 
 class ReplayBuffer:
-    def __init__(self):
+    def __init__(self, num_steps: int, num_envs: int, obs_shape):
+        self.num_steps = num_steps
+        self.num_envs = num_envs
+        self.obs = np.zeros((num_steps, num_envs, *obs_shape), dtype=np.float32)
+        self.actions = np.zeros((num_steps, num_envs), dtype=np.int32)
+        self.log_probs = np.zeros((num_steps, num_envs), dtype=np.float32)
+        self.rewards = np.zeros((num_steps, num_envs), dtype=np.float32)
+        self.dones = np.zeros((num_steps, num_envs), dtype=np.float32)
+        self.values = np.zeros((num_steps, num_envs), dtype=np.float32)
         self.reset()
 
     def reset(self):
-        self.obs = []
-        self.actions = []
-        self.log_probs = []
-        self.rewards = []
-        self.dones = []
-        self.values = []
+        self.size = 0
 
     def add(self, obs, actions, log_probs, rewards, dones, values):
-        self.obs.append(jnp.array(obs))
-        self.actions.append(jnp.array(actions))
-        self.log_probs.append(jnp.array(log_probs))
-        self.rewards.append(jnp.array(rewards))
-        self.dones.append(jnp.array(dones))
-        self.values.append(jnp.array(values))
+        if self.size >= self.num_steps:
+            raise ValueError("ReplayBuffer is full. Call reset() before adding new data.")
+        idx = self.size
+        self.obs[idx] = np.asarray(obs, dtype=np.float32)
+        self.actions[idx] = np.asarray(actions, dtype=np.int32)
+        self.log_probs[idx] = np.asarray(log_probs, dtype=np.float32)
+        self.rewards[idx] = np.asarray(rewards, dtype=np.float32)
+        self.dones[idx] = np.asarray(dones, dtype=np.float32)
+        self.values[idx] = np.asarray(values, dtype=np.float32)
+        self.size += 1
 
     def get(self):
+        if self.size != self.num_steps:
+            raise ValueError(f"ReplayBuffer not full: expected {self.num_steps}, got {self.size}")
         return (
-            jnp.stack(self.obs, axis=0),
-            jnp.stack(self.actions, axis=0),
-            jnp.stack(self.log_probs, axis=0),
-            jnp.stack(self.rewards, axis=0),
-            jnp.stack(self.dones, axis=0),
-            jnp.stack(self.values, axis=0),
+            jnp.asarray(self.obs),
+            jnp.asarray(self.actions),
+            jnp.asarray(self.log_probs),
+            jnp.asarray(self.rewards),
+            jnp.asarray(self.dones),
+            jnp.asarray(self.values),
         )
 
 
@@ -140,35 +152,22 @@ def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics
 
 def make_minibatches(batch, initial_carry, env_indices, envs_per_batch):
     obs, actions, old_log_probs, rewards, dones, values, advantages, returns = batch
+    env_ids = jnp.asarray(env_indices, dtype=jnp.int32).reshape(-1, envs_per_batch)
 
-    obs_mb = []
-    dones_mb = []
-    actions_mb = []
-    log_probs_mb = []
-    advantages_mb = []
-    returns_mb = []
-    carry_c_mb = []
-    carry_h_mb = []
-
-    for start in range(0, env_indices.shape[0], envs_per_batch):
-        env_ids = env_indices[start:start + envs_per_batch]
-        obs_mb.append(obs[:, env_ids])
-        dones_mb.append(dones[:, env_ids])
-        actions_mb.append(actions[:, env_ids])
-        log_probs_mb.append(old_log_probs[:, env_ids])
-        advantages_mb.append(advantages[:, env_ids])
-        returns_mb.append(returns[:, env_ids])
-        carry_c_mb.append(initial_carry[0][env_ids])
-        carry_h_mb.append(initial_carry[1][env_ids])
+    def select_time_env(x):
+        return jnp.swapaxes(jnp.take(x, env_ids, axis=1), 0, 1)
 
     return (
-        jnp.stack(obs_mb, axis=0),
-        jnp.stack(dones_mb, axis=0),
-        jnp.stack(actions_mb, axis=0),
-        jnp.stack(log_probs_mb, axis=0),
-        jnp.stack(advantages_mb, axis=0),
-        jnp.stack(returns_mb, axis=0),
-        (jnp.stack(carry_c_mb, axis=0), jnp.stack(carry_h_mb, axis=0)),
+        select_time_env(obs),
+        select_time_env(dones),
+        select_time_env(actions),
+        select_time_env(old_log_probs),
+        select_time_env(advantages),
+        select_time_env(returns),
+        (
+            jnp.take(initial_carry[0], env_ids, axis=0),
+            jnp.take(initial_carry[1], env_ids, axis=0),
+        ),
     )
 
 
@@ -179,7 +178,7 @@ def parse_arguments():
     parser.add_argument("--num-iter", type=int, default=100000)
     parser.add_argument("--num-steps", type=int, default=128)
     parser.add_argument("--num-envs", type=int, default=64)
-    parser.add_argument("--minibatch-size", type=int, default=512)
+    parser.add_argument("--num-minibatch", type=int, default=8)
     parser.add_argument("--num-epochs", type=int, default=4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lmbda", type=float, default=0.97)
@@ -191,10 +190,9 @@ def parse_arguments():
 def main():
     args = parse_arguments()
 
-    assert args.minibatch_size % args.num_steps == 0
-    envs_per_batch = args.minibatch_size // args.num_steps
-    assert envs_per_batch >= 1
-    assert args.num_envs % envs_per_batch == 0
+    assert args.num_minibatch >= 1
+    assert args.num_envs % args.num_minibatch == 0
+    envs_per_batch = args.num_envs // args.num_minibatch
 
 
     wandb.init(project="minimal-flaxrl", name=f"ppo_lstm_{args.env_name}", config=vars(args))
@@ -202,7 +200,6 @@ def main():
     rngs = nnx.Rngs(args.seed)
     ppo = PPOLSTM(rngs=rngs)
     optimizer = nnx.Optimizer(ppo, optax.adamw(args.learning_rate), wrt=nnx.Param)
-    replay_buffer = ReplayBuffer()
 
     metrics = nnx.metrics.MultiMetric(
         critic_loss=nnx.metrics.Average("critic_loss"),
@@ -213,6 +210,7 @@ def main():
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
 
     obs, _ = envs.reset(seed=args.seed)
+    replay_buffer = ReplayBuffer(args.num_steps, args.num_envs, envs.single_observation_space.shape)
     done = np.zeros(args.num_envs, dtype=np.float32)
     carry = ppo.init_carry(args.num_envs, rngs)
 
@@ -248,7 +246,7 @@ def main():
 
         train_batch = (obs_batch, actions_batch, log_probs_batch, rewards_batch, dones_batch, values_batch, advantages, returns)
 
-        num_minibatches = args.num_envs // envs_per_batch
+        num_minibatches = args.num_minibatch
         for _ in range(args.num_epochs):
             env_indices = np.asarray(jax.random.permutation(rngs(), args.num_envs))
             env_indices = env_indices[: num_minibatches * envs_per_batch]
