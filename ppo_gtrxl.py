@@ -14,11 +14,15 @@ import optax
 import rlax
 import wandb
 
+MODEL_DTYPE = jnp.bfloat16
+PARAM_DTYPE = jnp.bfloat16
+
 
 class ReplayBuffer:
     def __init__(self, num_steps: int, num_envs: int, obs_shape):
         self.num_steps = num_steps
         self.num_envs = num_envs
+        # Keep rollout tensors in float32 for precision; but not strictly tested.
         self.obs = np.zeros((num_steps, num_envs, *obs_shape), dtype=np.float32)
         self.actions = np.zeros((num_steps, num_envs), dtype=np.int32)
         self.log_probs = np.zeros((num_steps, num_envs), dtype=np.float32)
@@ -63,13 +67,13 @@ class TrXLState(struct.PyTreeNode):
 
 class GRUGate(nnx.Module):
     def __init__(self, dim: int, bias_init: float = 2.0, *, rngs: nnx.Rngs):
-        self.w_r = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
-        self.u_r = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
-        self.w_z = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
-        self.u_z = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
-        self.w_g = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
-        self.u_g = nnx.Linear(dim, dim, use_bias=False, rngs=rngs)
-        self.b_g = nnx.Param(jnp.full((dim,), bias_init, dtype=jnp.float32))
+        self.w_r = nnx.Linear(dim, dim, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.u_r = nnx.Linear(dim, dim, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.w_z = nnx.Linear(dim, dim, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.u_z = nnx.Linear(dim, dim, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.w_g = nnx.Linear(dim, dim, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.u_g = nnx.Linear(dim, dim, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.b_g = nnx.Param(jnp.full((dim,), bias_init, dtype=MODEL_DTYPE))
 
     def __call__(self, x, y):
         r = jax.nn.sigmoid(self.w_r(y) + self.u_r(x))
@@ -83,20 +87,22 @@ class GTrXLBlock(nnx.Module):
         if dim % num_heads != 0:
             raise ValueError(f"dim must be divisible by num_heads, got dim={dim}, num_heads={num_heads}")
 
-        self.norm_attn = nnx.LayerNorm(num_features=dim, rngs=rngs)
-        self.norm_ffn = nnx.LayerNorm(num_features=dim, rngs=rngs)
+        self.norm_attn = nnx.LayerNorm(num_features=dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.norm_ffn = nnx.LayerNorm(num_features=dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
 
         self.attention = nnx.MultiHeadAttention(
             num_heads=num_heads,
             in_features=dim,
             qkv_features=dim,
             out_features=dim,
+            dtype=MODEL_DTYPE,
+            param_dtype=PARAM_DTYPE,
             dropout_rate=0.0,
             decode=False,
             use_bias=False,
             rngs=rngs,
         )
-        self.fc = nnx.Linear(dim, dim, rngs=rngs)
+        self.fc = nnx.Linear(dim, dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
 
         self.gate_attn = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
         self.gate_ffn = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
@@ -146,30 +152,30 @@ class PPOGTrXL(nnx.Module):
         self.n_layers = trxl_num_layers
         self.memory_len = trxl_memory_length
 
-        self.fc_encoder = nnx.Linear(obs_dim, trxl_dim, rngs=rngs)
+        self.fc_encoder = nnx.Linear(obs_dim, trxl_dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
         self.layers = nnx.List([
             GTrXLBlock(trxl_dim, trxl_num_heads, gtrxl_gate_bias_init, rngs=rngs)
             for _ in range(trxl_num_layers)
         ])
-        self.hidden_post_trxl = nnx.Linear(trxl_dim, trxl_dim, rngs=rngs)
-        self.fc_pi = nnx.Linear(trxl_dim, num_actions, rngs=rngs)
-        self.fc_v = nnx.Linear(trxl_dim, 1, rngs=rngs)
+        self.hidden_post_trxl = nnx.Linear(trxl_dim, trxl_dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.fc_pi = nnx.Linear(trxl_dim, num_actions, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.fc_v = nnx.Linear(trxl_dim, 1, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
 
-        freqs = jnp.arange(0, trxl_dim, 2, dtype=jnp.float32)
+        freqs = jnp.arange(0, trxl_dim, 2, dtype=MODEL_DTYPE)
         self.inv_freq = 10_000.0 ** (-freqs / trxl_dim)
 
     def init_state(self, batch_size: int):
         return TrXLState(
-            memory=jnp.zeros((batch_size, self.memory_len, self.n_layers, self.hidden_dim), dtype=jnp.float32),
+            memory=jnp.zeros((batch_size, self.memory_len, self.n_layers, self.hidden_dim), dtype=MODEL_DTYPE),
             valid_len=jnp.zeros((batch_size,), dtype=jnp.int32),
             pos=jnp.zeros((batch_size,), dtype=jnp.int32),
         )
 
     def _encode(self, obs):
-        return self.fc_encoder(jnp.asarray(obs, dtype=jnp.float32))
+        return self.fc_encoder(jnp.asarray(obs, dtype=MODEL_DTYPE))
 
     def _position_embedding(self, positions):
-        clipped = jnp.maximum(positions, 0).astype(jnp.float32)
+        clipped = jnp.maximum(positions, 0).astype(MODEL_DTYPE)
         sinusoid = clipped[..., None] * self.inv_freq[None, :]
         return jnp.concatenate([jnp.sin(sinusoid), jnp.cos(sinusoid)], axis=-1)
 
@@ -270,6 +276,9 @@ class PPOGTrXL(nnx.Module):
 @nnx.jit
 def sample_action(model, obs, state, done, rngs):
     logits, value, new_state = model.step(obs, state, done)
+    # Keep sampling numerics in float32 for precision; but not strictly tested.
+    logits = logits.astype(jnp.float32)
+    value = value.astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     actions = rngs.categorical(logits, axis=-1)
     sampled_log_prob = jnp.take_along_axis(log_probs, actions[..., None], axis=-1).squeeze(-1)
@@ -279,7 +288,8 @@ def sample_action(model, obs, state, done, rngs):
 @nnx.jit
 def bootstrap_value(model, obs, state, done):
     _, value, _ = model.step(obs, state, done)
-    return value
+    # Keep bootstrap values in float32 for precision; but not strictly tested.
+    return value.astype(jnp.float32)
 
 
 def calculate_gae(rewards, values, dones, next_value, next_done, gamma: float, lmbda: float):
@@ -302,6 +312,11 @@ def loss_fn(model, batch, clip_eps, ent_coef):
     obs, dones, actions, old_log_probs, advantages, returns, init_state = batch
 
     logits, values, final_state = model.unroll(obs, dones, init_state)
+    old_log_probs = old_log_probs.astype(MODEL_DTYPE)
+    advantages = advantages.astype(MODEL_DTYPE)
+    returns = returns.astype(MODEL_DTYPE)
+    clip_eps = jnp.asarray(clip_eps, dtype=MODEL_DTYPE)
+    ent_coef = jnp.asarray(ent_coef, dtype=MODEL_DTYPE)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     selected_log_probs = jnp.take_along_axis(log_probs, actions[..., None], axis=-1).squeeze(-1)
 
@@ -309,7 +324,7 @@ def loss_fn(model, batch, clip_eps, ent_coef):
     actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
     critic_loss = optax.huber_loss(values, jax.lax.stop_gradient(returns)).mean()
     entropy = -jnp.sum(jax.nn.softmax(logits, axis=-1) * log_probs, axis=-1).mean()
-    total_loss = actor_loss + 0.5 * critic_loss - ent_coef * entropy
+    total_loss = actor_loss + jnp.asarray(0.5, dtype=MODEL_DTYPE) * critic_loss - ent_coef * entropy
     return total_loss, (actor_loss, critic_loss, entropy, final_state)
 
 
