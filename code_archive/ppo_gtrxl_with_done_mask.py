@@ -1,4 +1,5 @@
 import os
+import time
 from argparse import ArgumentParser
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -14,7 +15,14 @@ import rlax
 import wandb
 
 
+OBS_DIM = 8
+NUM_ACTIONS = 4
+MAX_EPISODE_STEPS = 300
+
+
 class ReplayBuffer:
+    """Fixed-size rollout buffer for PPO."""
+
     def __init__(self, num_steps: int, num_envs: int, obs_shape):
         self.num_steps = num_steps
         self.num_envs = num_envs
@@ -32,18 +40,20 @@ class ReplayBuffer:
     def add(self, obs, actions, log_probs, rewards, dones, values):
         if self.size >= self.num_steps:
             raise ValueError("ReplayBuffer is full. Call reset() before adding new data.")
-        idx = self.size
-        self.obs[idx] = np.asarray(obs, dtype=np.float32)
-        self.actions[idx] = np.asarray(actions, dtype=np.int32)
-        self.log_probs[idx] = np.asarray(log_probs, dtype=np.float32)
-        self.rewards[idx] = np.asarray(rewards, dtype=np.float32)
-        self.dones[idx] = np.asarray(dones, dtype=np.float32)
-        self.values[idx] = np.asarray(values, dtype=np.float32)
+
+        t = self.size
+        self.obs[t] = np.asarray(obs, dtype=np.float32)
+        self.actions[t] = np.asarray(actions, dtype=np.int32)
+        self.log_probs[t] = np.asarray(log_probs, dtype=np.float32)
+        self.rewards[t] = np.asarray(rewards, dtype=np.float32)
+        self.dones[t] = np.asarray(dones, dtype=np.float32)
+        self.values[t] = np.asarray(values, dtype=np.float32)
         self.size += 1
 
-    def get(self):
+    def as_jax(self):
         if self.size != self.num_steps:
             raise ValueError(f"ReplayBuffer not full: expected {self.num_steps}, got {self.size}")
+
         return (
             jnp.asarray(self.obs),
             jnp.asarray(self.actions),
@@ -55,9 +65,17 @@ class ReplayBuffer:
 
 
 class TrXLState(struct.PyTreeNode):
-    memory: jax.Array
-    valid_len: jax.Array
-    pos: jax.Array
+    memory: jax.Array       # [B, M, L, D]
+    valid_len: jax.Array    # [B]
+    pos: jax.Array          # [B]
+
+
+def detach_state(state: TrXLState) -> TrXLState:
+    return TrXLState(
+        memory=jax.lax.stop_gradient(state.memory),
+        valid_len=jax.lax.stop_gradient(state.valid_len),
+        pos=jax.lax.stop_gradient(state.pos),
+    )
 
 
 class GRUGate(nnx.Module):
@@ -82,10 +100,10 @@ class GTrXLBlock(nnx.Module):
         if dim % num_heads != 0:
             raise ValueError(f"dim must be divisible by num_heads, got dim={dim}, num_heads={num_heads}")
 
-        self.norm_attn = nnx.LayerNorm(num_features=dim, rngs=rngs)
-        self.norm_ffn = nnx.LayerNorm(num_features=dim, rngs=rngs)
+        self.attn_norm = nnx.LayerNorm(num_features=dim, rngs=rngs)
+        self.ffn_norm = nnx.LayerNorm(num_features=dim, rngs=rngs)
 
-        self.attention = nnx.MultiHeadAttention(
+        self.attn = nnx.MultiHeadAttention(
             num_heads=num_heads,
             in_features=dim,
             qkv_features=dim,
@@ -95,33 +113,27 @@ class GTrXLBlock(nnx.Module):
             use_bias=False,
             rngs=rngs,
         )
-        self.fc = nnx.Linear(dim, dim, rngs=rngs)
+        self.ffn = nnx.Linear(dim, dim, rngs=rngs)
 
-        self.gate_attn = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
-        self.gate_ffn = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
+        self.attn_gate = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
+        self.ffn_gate = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
 
-    def __call__(self, memory, query, memory_mask):
-        if memory_mask.ndim == 2:
-            attn_mask = memory_mask[:, None, None, :]
-        elif memory_mask.ndim == 3:
-            attn_mask = memory_mask[:, None, :, :]
+    def __call__(self, memory, query, mask):
+        if mask.ndim == 2:
+            attn_mask = mask[:, None, None, :]
+        elif mask.ndim == 3:
+            attn_mask = mask[:, None, :, :]
         else:
-            raise ValueError(f"memory_mask must be rank-2 or rank-3, got {memory_mask.ndim}")
+            raise ValueError(f"memory_mask must be rank-2 or rank-3, got {mask.ndim}")
 
-        mem_norm = self.norm_attn(memory)
-        q_norm = self.norm_attn(query)
+        mem = self.attn_norm(memory)
+        q = self.attn_norm(query)
 
-        attn_out = self.attention(
-            q_norm,
-            mem_norm,
-            mem_norm,
-            mask=attn_mask,
-            deterministic=True,
-        )
-        x = self.gate_attn(query, nnx.relu(attn_out))
+        attn_out = self.attn(q, mem, mem, mask=attn_mask, deterministic=True)
+        x = self.attn_gate(query, nnx.relu(attn_out))
 
-        ffn_out = self.fc(self.norm_ffn(x))
-        x = self.gate_ffn(x, nnx.relu(ffn_out))
+        ffn_out = self.ffn(self.ffn_norm(x))
+        x = self.ffn_gate(x, nnx.relu(ffn_out))
         return x
 
 
@@ -142,34 +154,34 @@ class PPOGTrXL(nnx.Module):
             raise ValueError(f"trxl_dim must be even for sinusoidal encoding, got {trxl_dim}")
 
         self.hidden_dim = trxl_dim
-        self.n_layers = trxl_num_layers
+        self.num_layers = trxl_num_layers
         self.memory_len = trxl_memory_length
 
-        self.fc_encoder = nnx.Linear(obs_dim, trxl_dim, rngs=rngs)
+        self.encoder = nnx.Linear(obs_dim, trxl_dim, rngs=rngs)
         self.layers = nnx.List([
             GTrXLBlock(trxl_dim, trxl_num_heads, gtrxl_gate_bias_init, rngs=rngs)
             for _ in range(trxl_num_layers)
         ])
-        self.hidden_post_trxl = nnx.Linear(trxl_dim, trxl_dim, rngs=rngs)
-        self.fc_pi = nnx.Linear(trxl_dim, num_actions, rngs=rngs)
-        self.fc_v = nnx.Linear(trxl_dim, 1, rngs=rngs)
+        self.post_trxl = nnx.Linear(trxl_dim, trxl_dim, rngs=rngs)
+        self.policy_head = nnx.Linear(trxl_dim, num_actions, rngs=rngs)
+        self.value_head = nnx.Linear(trxl_dim, 1, rngs=rngs)
 
         freqs = jnp.arange(0, trxl_dim, 2, dtype=jnp.float32)
         self.inv_freq = 10_000.0 ** (-freqs / trxl_dim)
 
-    def init_state(self, batch_size: int):
+    def init_state(self, batch_size: int) -> TrXLState:
         return TrXLState(
-            memory=jnp.zeros((batch_size, self.memory_len, self.n_layers, self.hidden_dim), dtype=jnp.float32),
+            memory=jnp.zeros((batch_size, self.memory_len, self.num_layers, self.hidden_dim), dtype=jnp.float32),
             valid_len=jnp.zeros((batch_size,), dtype=jnp.int32),
             pos=jnp.zeros((batch_size,), dtype=jnp.int32),
         )
 
-    def _encode(self, obs):
-        return self.fc_encoder(jnp.asarray(obs, dtype=jnp.float32))
+    def _encode_obs(self, obs):
+        return self.encoder(jnp.asarray(obs, dtype=jnp.float32))
 
-    def _position_embedding(self, positions):
-        clipped = jnp.maximum(positions, 0).astype(jnp.float32)
-        sinusoid = clipped[..., None] * self.inv_freq[None, :]
+    def _pos_emb(self, positions):
+        positions = jnp.maximum(positions, 0).astype(jnp.float32)
+        sinusoid = positions[..., None] * self.inv_freq[None, :]
         return jnp.concatenate([jnp.sin(sinusoid), jnp.cos(sinusoid)], axis=-1)
 
     @staticmethod
@@ -182,20 +194,21 @@ class PPOGTrXL(nnx.Module):
             pos=state.pos * mask_int,
         )
 
-    def _trxl_step(self, state: TrXLState, x_t):
+    def _step_core(self, state: TrXLState, x_t):
         memory_idx = jnp.arange(self.memory_len, dtype=jnp.int32)[None, :]
         memory_mask = memory_idx >= (self.memory_len - state.valid_len[:, None])
-        memory_positions = state.pos[:, None] + memory_idx - self.memory_len
-        memories = state.memory + self._position_embedding(memory_positions)[:, :, None, :]
+
+        memory_pos = state.pos[:, None] + memory_idx - self.memory_len
+        memories = state.memory + self._pos_emb(memory_pos)[:, :, None, :]
 
         x = x_t
-        layer_tokens = []
+        layer_inputs = []
         for i, layer in enumerate(self.layers):
-            layer_tokens.append(x)
+            layer_inputs.append(x)
             x = layer(memories[:, :, i], x[:, None, :], memory_mask)
             x = x.squeeze(1)
 
-        new_tokens = jnp.stack(layer_tokens, axis=1)
+        new_tokens = jnp.stack(layer_inputs, axis=1)
         new_memory = jnp.concatenate([state.memory[:, 1:], new_tokens[:, None, :, :]], axis=1)
         new_state = TrXLState(
             memory=new_memory,
@@ -205,100 +218,91 @@ class PPOGTrXL(nnx.Module):
         return new_state, x
 
     def step(self, obs, state: TrXLState, done):
-        x = self._encode(obs)
+        x = self._encode_obs(obs)
         state = self._reset_state_on_done(state, done)
-        state, hidden = self._trxl_step(state, x)
-        hidden = nnx.relu(self.hidden_post_trxl(hidden))
-        logits = self.fc_pi(hidden)
-        value = self.fc_v(hidden).squeeze(-1)
+        state, hidden = self._step_core(state, x)
+
+        hidden = nnx.relu(self.post_trxl(hidden))
+        logits = self.policy_head(hidden)
+        value = self.value_head(hidden).squeeze(-1)
         return logits, value, state
 
     def _unroll_metadata(self, done, init_state: TrXLState):
-        # done: [B, T]   (whether reset is needed before seeing obs_t)
-        B, T = done.shape
-        M = self.memory_len
+        # done: [B, T] (whether reset is needed before seeing obs_t)
+        _, num_steps = done.shape
+        memory_len = self.memory_len
 
-        t = jnp.arange(T, dtype=jnp.int32)[None, :]   # [1, T]
-        m = jnp.arange(M, dtype=jnp.int32)[None, :]   # [1, M]
+        t = jnp.arange(num_steps, dtype=jnp.int32)[None, :]
+        m = jnp.arange(memory_len, dtype=jnp.int32)[None, :]
 
-        # episode id: increments whenever a reset occurs
-        episode = jnp.cumsum(done, axis=1)  # [B, T]
+        episode = jnp.cumsum(done, axis=1)
+        last_reset = jnp.maximum.accumulate(
+            jnp.where(done == 1, t, -jnp.ones_like(t)),
+            axis=1,
+        )
 
-        # "most recent reset index" at each timestep
-        last_reset = jnp.maximum.accumulate(jnp.where(done == 1, t, -jnp.ones_like(t)), axis=1)  # [B, T]
-
-        # query position: continues from init_state.pos before reset,
-        # and restarts from 0 after reset
         query_pos = jnp.where(
             episode == 0,
             init_state.pos[:, None] + t,
             t - last_reset,
-        )  # [B, T]
+        )
 
-        # init memory is right-aligned
-        mem_valid = m >= (M - init_state.valid_len[:, None])  # [B, M]
-        mem_pos = init_state.pos[:, None] + m - M             # [B, M]
+        mem_valid = m >= (memory_len - init_state.valid_len[:, None])
+        mem_pos = init_state.pos[:, None] + m - memory_len
 
-        # send invalid memory to episode=-1 so it is automatically excluded by the mask
-        key_episode = jnp.concatenate([jnp.where(mem_valid, 0, -1), episode], axis=1)  # [B, M+T]
-        key_pos = jnp.concatenate([jnp.where(mem_valid, mem_pos, -M - 1), query_pos], axis=1)  # [B, M+T]
+        key_episode = jnp.concatenate([jnp.where(mem_valid, 0, -1), episode], axis=1)
+        key_pos = jnp.concatenate([jnp.where(mem_valid, mem_pos, -memory_len - 1), query_pos], axis=1)
 
-        # query can only attend to the past M tokens in the same episode
         attn_mask = (
-            (key_episode[:, None, :] == episode[:, :, None]) &
-            (key_pos[:, None, :] < query_pos[:, :, None]) &
-            (key_pos[:, None, :] >= query_pos[:, :, None] - M)
-        )  # [B, T, M+T]
+            (key_episode[:, None, :] == episode[:, :, None])
+            & (key_pos[:, None, :] < query_pos[:, :, None])
+            & (key_pos[:, None, :] >= query_pos[:, :, None] - memory_len)
+        )
 
-        # final memory length that remains after rollout ends
         final_valid_len = jnp.where(
             episode[:, -1] == 0,
-            init_state.valid_len + T,   # if no reset during rollout, previous memory is kept
-            T - last_reset[:, -1],      # only tokens after the last reset remain
+            init_state.valid_len + num_steps,
+            num_steps - last_reset[:, -1],
         )
-        final_valid_len = jnp.minimum(final_valid_len, M)
+        final_valid_len = jnp.minimum(final_valid_len, memory_len)
         final_pos = query_pos[:, -1] + 1
-
         return mem_pos, query_pos, attn_mask, final_valid_len, final_pos
 
     def unroll(self, obs_seq, done_seq, init_state: TrXLState):
-        # obs_seq:  [T, B, obs_dim]
-        # done_seq: [T, B]
-        x = jnp.swapaxes(self._encode(obs_seq), 0, 1)  # [B, T, D]
+        x = jnp.swapaxes(self._encode_obs(obs_seq), 0, 1)  # [B, T, D]
         done = jnp.swapaxes(jnp.asarray(done_seq, dtype=jnp.int32), 0, 1)  # [B, T]
 
-        mem_pos, query_pos, attn_mask, final_valid_len, final_pos = self._unroll_metadata(done, init_state)
+        memory_pos, query_pos, attn_mask, final_valid_len, final_pos = self._unroll_metadata(done, init_state)
 
-        mem_pos_emb = self._position_embedding(mem_pos)      # [B, M, D]
-        query_pos_emb = self._position_embedding(query_pos)  # [B, T, D]
+        query_pos_emb = self._pos_emb(query_pos)
+        memory_pos_emb = self._pos_emb(memory_pos)
 
         layer_inputs = []
         for i, layer in enumerate(self.layers):
-            layer_inputs.append(x)  # token to store as same-layer memory
-
+            layer_inputs.append(x)
             kv = jnp.concatenate(
                 [
-                    init_state.memory[:, :, i] + mem_pos_emb,  # previous memory
-                    x + query_pos_emb,                         # current rollout prefix
+                    init_state.memory[:, :, i] + memory_pos_emb,
+                    x + query_pos_emb,
                 ],
                 axis=1,
-            )  # [B, M+T, D]
+            )
+            x = layer(kv, x, attn_mask)
 
-            x = layer(kv, x, attn_mask)  # [B, T, D]
+        hidden = nnx.relu(self.post_trxl(x))
+        logits = jnp.swapaxes(self.policy_head(hidden), 0, 1)
+        values = jnp.swapaxes(self.value_head(hidden).squeeze(-1), 0, 1)
 
-        hidden = nnx.relu(self.hidden_post_trxl(x))
-        logits = jnp.swapaxes(self.fc_pi(hidden), 0, 1)                  # [T, B, A]
-        values = jnp.swapaxes(self.fc_v(hidden).squeeze(-1), 0, 1)       # [T, B]
-
-        # final memory is always a suffix of [init_memory, rollout_tokens]
-        layer_inputs = jnp.stack(layer_inputs, axis=2)  # [B, T, L, D]
-        history = jnp.concatenate([init_state.memory, layer_inputs], axis=1)  # [B, M+T, L, D]
-        tail = history[:, -self.memory_len :]  # [B, M, L, D]
+        final_layers = []
+        for i in range(self.num_layers):
+            tokens = jnp.concatenate([init_state.memory[:, :, i], layer_inputs[i]], axis=1)
+            final_layers.append(tokens[:, -self.memory_len :, :])
+        tail = jnp.stack(final_layers, axis=2)
 
         tail_mask = (
             jnp.arange(self.memory_len, dtype=jnp.int32)[None, :]
             >= (self.memory_len - final_valid_len[:, None])
-        )  # [B, M]
+        )
 
         final_state = TrXLState(
             memory=jnp.where(tail_mask[:, :, None, None], tail, jnp.zeros_like(tail)),
@@ -341,8 +345,8 @@ def calculate_gae(rewards, values, dones, next_value, next_done, gamma: float, l
 
 def loss_fn(model, batch, clip_eps):
     obs, dones, actions, old_log_probs, advantages, returns, init_state = batch
-
     logits, values, final_state = model.unroll(obs, dones, init_state)
+
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     selected_log_probs = jnp.take_along_axis(log_probs, actions[..., None], axis=-1).squeeze(-1)
 
@@ -353,34 +357,56 @@ def loss_fn(model, batch, clip_eps):
     return total_loss, (actor_loss, critic_loss, final_state)
 
 
+def make_minibatches(batch, initial_state: TrXLState, env_indices, envs_per_batch: int, segment_length: int):
+    obs, actions, old_log_probs, _, dones, _, advantages, returns = batch
+    num_segments = obs.shape[0] // segment_length
+
+    env_ids = jnp.asarray(env_indices, dtype=jnp.int32).reshape(-1, envs_per_batch)
+
+    def split_time_and_env(x):
+        x = jnp.take(x, env_ids, axis=1)  # [T, MB, E, ...]
+        x = jnp.swapaxes(x, 0, 1)  # [MB, T, E, ...]
+        return x.reshape(x.shape[0], num_segments, segment_length, *x.shape[2:])
+
+    return (
+        split_time_and_env(obs),
+        split_time_and_env(dones),
+        split_time_and_env(actions),
+        split_time_and_env(old_log_probs),
+        split_time_and_env(advantages),
+        split_time_and_env(returns),
+        TrXLState(
+            memory=jnp.take(initial_state.memory, env_ids, axis=0),
+            valid_len=jnp.take(initial_state.valid_len, env_ids, axis=0),
+            pos=jnp.take(initial_state.pos, env_ids, axis=0),
+        ),
+    )
+
+
 @nnx.jit
-def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics: nnx.metrics.MultiMetric, clip_eps=0.2):
+def update_ppo(model, optimizer, minibatches, metrics, clip_eps=0.2):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
-    def scan_step(carry, minibatch):
+    def train_minibatch(carry, minibatch):
         model, optimizer, metrics = carry
         obs_segments, dones_segments, actions_segments, old_log_probs_segments, advantages_segments, returns_segments, init_state = minibatch
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
-        def segment_step(seg_carry, segment):
-            model, optimizer, metrics, state = seg_carry
+        def train_segment(carry, segment):
+            model, optimizer, metrics, state = carry
             obs, dones, actions, old_log_probs, advantages, returns = segment
-            (_, (actor_loss, critic_loss, final_state)), grad = grad_fn(
+
+            (_, (actor_loss, critic_loss, next_state)), grad = grad_fn(
                 model,
                 (obs, dones, actions, old_log_probs, advantages, returns, state),
                 clip_eps,
             )
             optimizer.update(model, grad)
             metrics.update(actor_loss=actor_loss, critic_loss=critic_loss)
-            next_state = TrXLState(
-                memory=jax.lax.stop_gradient(final_state.memory),
-                valid_len=jax.lax.stop_gradient(final_state.valid_len),
-                pos=jax.lax.stop_gradient(final_state.pos),
-            )
-            return model, optimizer, metrics, next_state
+            return model, optimizer, metrics, detach_state(next_state)
 
-        model, optimizer, metrics, _ = segment_step(
+        model, optimizer, metrics, _ = train_segment(
             (model, optimizer, metrics, init_state),
             (
                 obs_segments,
@@ -393,35 +419,12 @@ def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics
         )
         return model, optimizer, metrics
 
-    scan_step((model, optimizer, metrics), minibatches)
+    train_minibatch((model, optimizer, metrics), minibatches)
 
 
-def make_minibatches(batch, initial_state: TrXLState, env_indices, envs_per_batch: int, segment_length: int):
-    obs, actions, old_log_probs, _rewards, dones, _values, advantages, returns = batch
-    num_segments = obs.shape[0] // segment_length
-    env_ids = jnp.asarray(env_indices, dtype=jnp.int32).reshape(-1, envs_per_batch)
-
-    def select_time_env(x):
-        selected = jnp.swapaxes(jnp.take(x, env_ids, axis=1), 0, 1)
-        return selected.reshape(selected.shape[0], num_segments, segment_length, *selected.shape[2:])
-
-    return (
-        select_time_env(obs),
-        select_time_env(dones),
-        select_time_env(actions),
-        select_time_env(old_log_probs),
-        select_time_env(advantages),
-        select_time_env(returns),
-        TrXLState(
-            memory=jnp.take(initial_state.memory, env_ids, axis=0),
-            valid_len=jnp.take(initial_state.valid_len, env_ids, axis=0),
-            pos=jnp.take(initial_state.pos, env_ids, axis=0),
-        ),
-    )
-
-
-def parse_arguments():
+def parse_args():
     parser = ArgumentParser()
+
     parser.add_argument("--env-name", type=str, default="LunarLander-v3")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iter", type=int, default=100000)
@@ -430,10 +433,12 @@ def parse_arguments():
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--num-minibatch", type=int, default=2)
     parser.add_argument("--num-epochs", type=int, default=3)
+
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lmbda", type=float, default=0.97)
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--clip-eps", type=float, default=0.2)
+
     parser.add_argument("--trxl-dim", type=int, default=128)
     parser.add_argument("--trxl-num-layers", type=int, default=3)
     parser.add_argument("--trxl-num-heads", type=int, default=2)
@@ -442,84 +447,94 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def main():
-    args = parse_arguments()
-
+def validate_args(args):
     assert args.env_name == "LunarLander-v3", "This minimal implementation supports only LunarLander-v3."
     assert args.num_minibatch >= 1
     assert args.num_envs % args.num_minibatch == 0
-    envs_per_batch = args.num_envs // args.num_minibatch
     assert args.segment_length > 0
     assert args.num_steps % args.segment_length == 0
     assert args.trxl_dim % args.trxl_num_heads == 0
     assert args.trxl_memory_length > 0
 
-    max_episode_steps = 300
-    memory_length = min(args.trxl_memory_length, max_episode_steps)
 
-    wandb.init(
-        project="minimal-flaxrl",
-        name=f"ppo_gtrxl_{args.env_name}",
-        config={**vars(args), "trxl_memory_length": memory_length},
-    )
+def main():
+    args = parse_args()
+    validate_args(args)
 
+    envs_per_batch = args.num_envs // args.num_minibatch
     rngs = nnx.Rngs(args.seed)
-    ppo = PPOGTrXL(
-        obs_dim=8,
-        num_actions=4,
+
+    # Init model, optimizer, and metrics
+    memory_len = min(args.trxl_memory_length, MAX_EPISODE_STEPS)
+    model = PPOGTrXL(
+        obs_dim=OBS_DIM,
+        num_actions=NUM_ACTIONS,
         trxl_dim=args.trxl_dim,
         trxl_num_layers=args.trxl_num_layers,
         trxl_num_heads=args.trxl_num_heads,
-        trxl_memory_length=memory_length,
+        trxl_memory_length=memory_len,
         gtrxl_gate_bias_init=args.gtrxl_gate_bias_init,
         rngs=rngs,
     )
-    optimizer = nnx.Optimizer(ppo, optax.adamw(args.learning_rate), wrt=nnx.Param)
-
+    optimizer = nnx.Optimizer(model, optax.adamw(args.learning_rate), wrt=nnx.Param)
     metrics = nnx.metrics.MultiMetric(
         critic_loss=nnx.metrics.Average("critic_loss"),
         actor_loss=nnx.metrics.Average("actor_loss"),
     )
 
-    envs = gym.make_vec(args.env_name, num_envs=args.num_envs, vectorization_mode="sync", max_episode_steps=max_episode_steps)
+    # Init environment
+    envs = gym.make_vec(
+        args.env_name,
+        num_envs=args.num_envs,
+        vectorization_mode="sync",
+        max_episode_steps=MAX_EPISODE_STEPS,
+    )
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
 
-    assert envs.single_observation_space.shape == (8,)
-    assert envs.single_action_space.n == 4
+    assert envs.single_observation_space.shape == (OBS_DIM,)
+    assert envs.single_action_space.n == NUM_ACTIONS
 
+    # init wandb
+    wandb.init(
+        project="minimal-flaxrl",
+        name=f"ppo_gtrxl_{args.env_name}",
+        config={**vars(args), "trxl_memory_length": memory_len},
+    )
+
+    # reset environment & init replay buffer
     obs, _ = envs.reset(seed=args.seed)
-    replay_buffer = ReplayBuffer(args.num_steps, args.num_envs, envs.single_observation_space.shape)
+    state = model.init_state(args.num_envs)
     done = np.zeros(args.num_envs, dtype=np.float32)
-    state = ppo.init_state(args.num_envs)
+    replay = ReplayBuffer(args.num_steps, args.num_envs, envs.single_observation_space.shape)
 
     global_env_step = 0
+    start_time = time.time()
     for iteration in range(args.num_iter):
         rollout_rewards = []
         rollout_lengths = []
         initial_state = TrXLState(memory=state.memory, valid_len=state.valid_len, pos=state.pos)
 
         for _ in range(args.num_steps):
-            log_prob, action, value, state = sample_action(ppo, obs, state, done, rngs)
+            log_prob, action, value, state = sample_action(model, obs, state, done, rngs)
 
             next_obs, reward, terminated, truncated, info = envs.step(np.asarray(action))
             next_done = np.maximum(terminated, truncated).astype(np.float32)
 
-            replay_buffer.add(obs, action, log_prob, reward, done, value)
+            replay.add(obs, action, log_prob, reward, done, value)
             global_env_step += args.num_envs
 
             if "_episode" in info:
-                for idx, finished in enumerate(info["_episode"]):
+                for i, finished in enumerate(info["_episode"]):
                     if finished:
-                        rollout_rewards.append(float(info["episode"]["r"][idx]))
-                        rollout_lengths.append(int(info["episode"]["l"][idx]))
+                        rollout_rewards.append(float(info["episode"]["r"][i]))
+                        rollout_lengths.append(int(info["episode"]["l"][i]))
 
             obs = next_obs
             done = next_done
 
-        rollout = replay_buffer.get()
-        obs_batch, actions_batch, log_probs_batch, rewards_batch, dones_batch, values_batch = rollout
+        obs_batch, actions_batch, log_probs_batch, rewards_batch, dones_batch, values_batch = replay.as_jax()
 
-        next_value = bootstrap_value(ppo, obs, state, done)
+        next_value = bootstrap_value(model, obs, state, done)
         advantages, returns = calculate_gae(
             rewards_batch,
             values_batch,
@@ -541,30 +556,36 @@ def main():
             returns,
         )
 
-        num_minibatches = args.num_minibatch
         for _ in range(args.num_epochs):
             env_indices = np.asarray(jax.random.permutation(rngs(), args.num_envs))
-            env_indices = env_indices[: num_minibatches * envs_per_batch]
-            minibatches = make_minibatches(train_batch, initial_state, env_indices, envs_per_batch, args.segment_length)
-            update_ppo(ppo, optimizer, minibatches, metrics, clip_eps=args.clip_eps)
+            minibatches = make_minibatches(
+                train_batch,
+                initial_state,
+                env_indices[: args.num_minibatch * envs_per_batch],
+                envs_per_batch,
+                args.segment_length,
+            )
+            update_ppo(model, optimizer, minibatches, metrics, clip_eps=args.clip_eps)
 
         metric_values = {k: float(v) for k, v in metrics.compute().items()}
+        sps = int(global_env_step / max(time.time() - start_time, 1e-6))
 
-        wandb_payload = {
+        log_data = {
             "train/iteration": iteration,
             "train/global_env_step": global_env_step,
+            "train/sps": sps,
             "train/actor_loss": metric_values["actor_loss"],
             "train/critic_loss": metric_values["critic_loss"],
         }
         if rollout_rewards:
-            wandb_payload["episode/reward_mean"] = float(np.mean(rollout_rewards))
-            wandb_payload["episode/reward_max"] = float(np.max(rollout_rewards))
-            wandb_payload["episode/length_mean"] = float(np.mean(rollout_lengths))
-            wandb_payload["episode/count"] = len(rollout_rewards)
-        wandb.log(wandb_payload, step=global_env_step)
+            log_data["episode/reward_mean"] = float(np.mean(rollout_rewards))
+            log_data["episode/reward_max"] = float(np.max(rollout_rewards))
+            log_data["episode/length_mean"] = float(np.mean(rollout_lengths))
+            log_data["episode/count"] = len(rollout_rewards)
+        wandb.log(log_data, step=global_env_step)
 
         metrics.reset()
-        replay_buffer.reset()
+        replay.reset()
 
     envs.close()
 
