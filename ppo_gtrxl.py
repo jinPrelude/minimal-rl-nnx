@@ -1,4 +1,5 @@
 import os
+import time
 from argparse import ArgumentParser
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -297,7 +298,7 @@ def calculate_gae(rewards, values, dones, next_value, next_done, gamma: float, l
     return advantages, returns
 
 
-def loss_fn(model, batch, clip_eps):
+def loss_fn(model, batch, clip_eps, ent_coef):
     obs, dones, actions, old_log_probs, advantages, returns, init_state = batch
 
     logits, values, final_state = model.unroll(obs, dones, init_state)
@@ -307,12 +308,13 @@ def loss_fn(model, batch, clip_eps):
     ratio = jnp.exp(selected_log_probs - old_log_probs)
     actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
     critic_loss = optax.huber_loss(values, jax.lax.stop_gradient(returns)).mean()
-    total_loss = actor_loss + 0.5 * critic_loss
-    return total_loss, (actor_loss, critic_loss, final_state)
+    entropy = -jnp.sum(jax.nn.softmax(logits, axis=-1) * log_probs, axis=-1).mean()
+    total_loss = actor_loss + 0.5 * critic_loss - ent_coef * entropy
+    return total_loss, (actor_loss, critic_loss, entropy, final_state)
 
 
 @nnx.jit
-def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics: nnx.metrics.MultiMetric, clip_eps=0.2):
+def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics: nnx.metrics.MultiMetric, clip_eps=0.2, ent_coef=0.0001):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
@@ -324,13 +326,14 @@ def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics
         def segment_step(seg_carry, segment):
             model, optimizer, metrics, state = seg_carry
             obs, dones, actions, old_log_probs, advantages, returns = segment
-            (_, (actor_loss, critic_loss, final_state)), grad = grad_fn(
+            (_, (actor_loss, critic_loss, entropy, final_state)), grad = grad_fn(
                 model,
                 (obs, dones, actions, old_log_probs, advantages, returns, state),
                 clip_eps,
+                ent_coef,
             )
             optimizer.update(model, grad)
-            metrics.update(actor_loss=actor_loss, critic_loss=critic_loss)
+            metrics.update(actor_loss=actor_loss, critic_loss=critic_loss, entropy=entropy)
             next_state = TrXLState(
                 memory=jax.lax.stop_gradient(final_state.memory),
                 valid_len=jax.lax.stop_gradient(final_state.valid_len),
@@ -392,6 +395,7 @@ def parse_arguments():
     parser.add_argument("--lmbda", type=float, default=0.97)
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--clip-eps", type=float, default=0.2)
+    parser.add_argument("--ent-coef", type=float, default=0.001)
     parser.add_argument("--trxl-dim", type=int, default=128)
     parser.add_argument("--trxl-num-layers", type=int, default=3)
     parser.add_argument("--trxl-num-heads", type=int, default=2)
@@ -437,6 +441,7 @@ def main():
     metrics = nnx.metrics.MultiMetric(
         critic_loss=nnx.metrics.Average("critic_loss"),
         actor_loss=nnx.metrics.Average("actor_loss"),
+        entropy=nnx.metrics.Average("entropy"),
     )
 
     envs = gym.make_vec(args.env_name, num_envs=args.num_envs, vectorization_mode="sync", max_episode_steps=max_episode_steps)
@@ -451,6 +456,7 @@ def main():
     state = ppo.init_state(args.num_envs)
 
     global_env_step = 0
+    start_time = time.time()
     for iteration in range(args.num_iter):
         rollout_rewards = []
         rollout_lengths = []
@@ -504,15 +510,18 @@ def main():
             env_indices = np.asarray(jax.random.permutation(rngs(), args.num_envs))
             env_indices = env_indices[: num_minibatches * envs_per_batch]
             minibatches = make_minibatches(train_batch, initial_state, env_indices, envs_per_batch, args.segment_length)
-            update_ppo(ppo, optimizer, minibatches, metrics, clip_eps=args.clip_eps)
+            update_ppo(ppo, optimizer, minibatches, metrics, clip_eps=args.clip_eps, ent_coef=args.ent_coef)
 
         metric_values = {k: float(v) for k, v in metrics.compute().items()}
+        sps = int(global_env_step / max(time.time() - start_time, 1e-6))
 
         wandb_payload = {
             "train/iteration": iteration,
             "train/global_env_step": global_env_step,
+            "train/sps": sps,
             "train/actor_loss": metric_values["actor_loss"],
             "train/critic_loss": metric_values["critic_loss"],
+            "train/entropy": metric_values["entropy"],
         }
         if rollout_rewards:
             wandb_payload["episode/reward_mean"] = float(np.mean(rollout_rewards))

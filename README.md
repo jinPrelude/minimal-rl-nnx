@@ -15,8 +15,8 @@ wandb login                       # for experiment logging
 |-----------|-------|---------|--------------------------------|-------------|
 | [PPO](ppo.py) | 228 | `python ppo.py` | ~40 sec | [LunarLander-v3](ppo.py) |
 | [PPO_LSTM](ppo_lstm.py) | 278 | `python ppo_lstm.py` | ~5 mins | [LunarLander-v3](ppo_lstm.py) |
-| [PPO_TrXL](ppo_trxl.py) (very unstable. use GTrXL) | 498 | `python ppo_trxl.py` | 1+ hour (recommend GPU training) | [LunarLander-v3](ppo_trxl.py) |
-| [PPO_GTrXL](ppo_gtrxl.py) | 531 | `python ppo_gtrxl.py` | 1+ hour (recommend GPU training) | [LunarLander-v3](ppo_gtrxl.py), [ALE/Breakout-v5](ppo_gtrxl_atari.py) |
+| [PPO_TrXL](ppo_trxl.py) (very unstable. use GTrXL) | 507 | `python ppo_trxl.py` | 1+ hour (recommend GPU training) | [LunarLander-v3](ppo_trxl.py) |
+| [PPO_GTrXL](ppo_gtrxl.py) | 539 | `python ppo_gtrxl.py` | 1+ hour (recommend GPU training) | [LunarLander-v3](ppo_gtrxl.py), [ALE/Breakout-v5](ppo_gtrxl_atari.py) |
 | [A2C](a2c.py) | 180 | `python a2c.py` | ~100 sec | [LunarLander-v3](a2c.py) |
 | [Impala](impala.py) ([cleanba](https://github.com/vwxyzjn/cleanba) style)| 263 | `python impala.py` | ~100 sec | [LunarLander-v3](impala.py) |
 | [Impala_LSTM](impala_lstm.py) | 294 | `python impala_lstm.py` | | [LunarLander-v3](impala_lstm.py) |
