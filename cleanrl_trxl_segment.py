@@ -174,10 +174,9 @@ class TrXLState:
         if done_mask.ndim != 1:
             raise ValueError(f"`done_mask` must be rank-1 [num_envs], got shape={tuple(done_mask.shape)}")
 
-        keep_mask = (~done_mask).view(-1, 1, 1, 1)
-        self.memory = torch.where(keep_mask, self.memory, torch.zeros_like(self.memory))
-        self.valid_len = torch.where(done_mask, torch.zeros_like(self.valid_len), self.valid_len)
-        self.pos = torch.where(done_mask, torch.zeros_like(self.pos), self.pos)
+        self.memory.mul_((~done_mask).view(-1, 1, 1, 1))
+        self.valid_len.masked_fill_(done_mask, 0)
+        self.pos.masked_fill_(done_mask, 0)
         return self
 
     def append_memory(self, token, max_episode_steps):
