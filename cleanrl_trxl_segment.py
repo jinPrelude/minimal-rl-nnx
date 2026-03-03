@@ -55,7 +55,7 @@ class Args:
     num_steps: int = 512
     """the number of steps to run in each environment per policy rollout"""
     segment_length: int = 32
-    """the number of sequential rollout steps processed in one truncated BPTT segment"""
+    """the number of rollout steps processed in one truncated BPTT segment"""
     anneal_steps: int = 32 * 512 * 10000
     """the number of steps to linearly anneal the learning rate and entropy coefficient from initial to final"""
     gamma: float = 0.995
@@ -96,14 +96,6 @@ class Args:
     """the positional encoding type of the transformer, choices: "", "absolute", "learned" """
     reconstruction_coef: float = 0.0
     """the coefficient of the observation reconstruction loss, if set to 0.0 the reconstruction loss is not used"""
-    segment_eval_mode: str = "parallel"
-    """segment evaluation mode, choices: "parallel", "sequential" """
-    parallel_equivalence_check_batches: int = 0
-    """if > 0, run sequential-vs-parallel equivalence checks for this many training minibatches"""
-    parallel_equivalence_atol: float = 1e-5
-    """absolute tolerance for sequential-vs-parallel equivalence checks"""
-    parallel_equivalence_rtol: float = 1e-4
-    """relative tolerance for sequential-vs-parallel equivalence checks"""
 
     # To be filled on runtime
     batch_size: int = 0
@@ -256,19 +248,6 @@ def build_parallel_eval_metadata(dones_seq, init_state, mem_len, max_episode_ste
     final_pos = torch.clamp(query_pos_unclamped[:, -1] + 1, min=0, max=max_episode_steps)
 
     return memory_indices, query_indices, attn_mask, final_valid_len, final_pos
-
-
-def assert_tensor_allclose(name, actual, expected, atol, rtol):
-    if actual.shape != expected.shape:
-        raise ValueError(
-            f"Equivalence check failed for `{name}`: shape mismatch {tuple(actual.shape)} != {tuple(expected.shape)}"
-        )
-    if not torch.allclose(actual, expected, atol=atol, rtol=rtol):
-        max_abs_diff = (actual - expected).abs().max().item()
-        raise ValueError(
-            f"Equivalence check failed for `{name}`: max_abs_diff={max_abs_diff:.6e} exceeds "
-            f"atol={atol}, rtol={rtol}"
-        )
 
 
 class PositionalEncoding(nn.Module):
@@ -432,7 +411,6 @@ class Agent(nn.Module):
         super().__init__()
         self.obs_shape = observation_space.shape
         self.max_episode_steps = max_episode_steps
-        self.segment_eval_mode = args.segment_eval_mode
 
         if len(self.obs_shape) > 1:
             self.encoder = nn.Sequential(
@@ -511,43 +489,7 @@ class Agent(nn.Module):
         entropies = torch.stack([dist.entropy() for dist in probs], dim=1).sum(1).reshape(-1)
         return action, torch.stack(log_probs, dim=1), entropies, self.critic(x).flatten(), memory
 
-    def evaluate_segment_sequential(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
-        seq_len = obs_seq.shape[0]
-        state = clone_trxl_state(init_state, device=obs_seq.device)
-        new_log_probs = []
-        entropies = []
-        values = []
-        reconstructions = []
-
-        for t in range(seq_len):
-            state = reset_done_in_state(state, dones_seq[t].bool())
-            memory_window, memory_mask, memory_indices = build_memory_inputs(
-                state, state.memory.shape[1], max_episode_steps
-            )
-            _, new_log_prob, entropy, value, new_memory = self.get_action_and_value(
-                obs_seq[t],
-                memory_window,
-                memory_mask,
-                memory_indices,
-                action=actions_seq[t],
-                detach_new_memory=False,
-            )
-            state = append_memory_token(state, new_memory, max_episode_steps)
-            new_log_probs.append(new_log_prob)
-            entropies.append(entropy)
-            values.append(value)
-            if hasattr(self, "transposed_cnn"):
-                reconstructions.append(self.reconstruct_observation())
-
-        reconstruction_seq = torch.stack(reconstructions, dim=0) if reconstructions else None
-        return (
-            torch.stack(new_log_probs, dim=0),
-            torch.stack(entropies, dim=0),
-            torch.stack(values, dim=0),
-            reconstruction_seq,
-        )
-
-    def evaluate_segment_parallel(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
+    def evaluate_segment(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
         seq_len, batch_size = obs_seq.shape[0], obs_seq.shape[1]
         state = clone_trxl_state(init_state, device=obs_seq.device)
         memory_indices, query_indices, attn_mask, _, _ = build_parallel_eval_metadata(
@@ -592,15 +534,6 @@ class Agent(nn.Module):
 
         return new_log_probs, entropies, values, reconstruction_seq
 
-    def evaluate_segment(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
-        if self.segment_eval_mode == "parallel":
-            return self.evaluate_segment_parallel(obs_seq, actions_seq, dones_seq, init_state, max_episode_steps)
-        if self.segment_eval_mode == "sequential":
-            return self.evaluate_segment_sequential(obs_seq, actions_seq, dones_seq, init_state, max_episode_steps)
-        raise ValueError(
-            f"`segment_eval_mode` must be one of {{'parallel', 'sequential'}}, got {self.segment_eval_mode!r}"
-        )
-
     def reconstruct_observation(self):
         x = self.transposed_cnn(self.x)
         return x.permute((0, 2, 3, 1))
@@ -616,18 +549,6 @@ if __name__ == "__main__":
         raise ValueError(f"`num_envs` ({args.num_envs}) must be divisible by `num_minibatches` ({args.num_minibatches})")
     if args.trxl_memory_length <= 0:
         raise ValueError(f"`trxl_memory_length` must be > 0, got {args.trxl_memory_length}")
-    if args.segment_eval_mode not in {"parallel", "sequential"}:
-        raise ValueError(
-            f"`segment_eval_mode` must be one of {{'parallel', 'sequential'}}, got {args.segment_eval_mode!r}"
-        )
-    if args.parallel_equivalence_check_batches < 0:
-        raise ValueError(
-            f"`parallel_equivalence_check_batches` must be >= 0, got {args.parallel_equivalence_check_batches}"
-        )
-    if args.parallel_equivalence_atol < 0:
-        raise ValueError(f"`parallel_equivalence_atol` must be >= 0, got {args.parallel_equivalence_atol}")
-    if args.parallel_equivalence_rtol < 0:
-        raise ValueError(f"`parallel_equivalence_rtol` must be >= 0, got {args.parallel_equivalence_rtol}")
 
     args.batch_size = int(args.num_envs * args.num_steps)
     args.num_segments = int(args.num_steps // args.segment_length)
@@ -823,7 +744,6 @@ if __name__ == "__main__":
         r_loss_values = []
         total_loss_values = []
         early_stop = False
-        equivalence_checks_done = 0
         for epoch in range(args.update_epochs):
             env_perm = torch.randperm(args.num_envs, device="cpu")
             for mb_start in range(0, args.num_envs, args.envs_per_minibatch):
@@ -848,49 +768,6 @@ if __name__ == "__main__":
                     newlogprob, entropy, newvalue, recon_seq = agent.evaluate_segment(
                         mb_obs, mb_actions, mb_dones, mb_init_state, max_episode_steps
                     )
-                    if (
-                        args.segment_eval_mode == "parallel"
-                        and args.parallel_equivalence_check_batches > 0
-                        and equivalence_checks_done < args.parallel_equivalence_check_batches
-                    ):
-                        with torch.no_grad():
-                            ref_newlogprob, ref_entropy, ref_newvalue, ref_recon_seq = agent.evaluate_segment_sequential(
-                                mb_obs, mb_actions, mb_dones, mb_init_state, max_episode_steps
-                            )
-                        assert_tensor_allclose(
-                            "newlogprob",
-                            newlogprob,
-                            ref_newlogprob,
-                            args.parallel_equivalence_atol,
-                            args.parallel_equivalence_rtol,
-                        )
-                        assert_tensor_allclose(
-                            "entropy",
-                            entropy,
-                            ref_entropy,
-                            args.parallel_equivalence_atol,
-                            args.parallel_equivalence_rtol,
-                        )
-                        assert_tensor_allclose(
-                            "newvalue",
-                            newvalue,
-                            ref_newvalue,
-                            args.parallel_equivalence_atol,
-                            args.parallel_equivalence_rtol,
-                        )
-                        if (recon_seq is None) != (ref_recon_seq is None):
-                            raise ValueError(
-                                "Equivalence check failed for `recon_seq`: one of `recon_seq` / `ref_recon_seq` is None"
-                            )
-                        if recon_seq is not None and ref_recon_seq is not None:
-                            assert_tensor_allclose(
-                                "recon_seq",
-                                recon_seq,
-                                ref_recon_seq,
-                                args.parallel_equivalence_atol,
-                                args.parallel_equivalence_rtol,
-                            )
-                        equivalence_checks_done += 1
 
                     flat_advantages = mb_advantages.reshape(-1)
                     if args.norm_adv:
