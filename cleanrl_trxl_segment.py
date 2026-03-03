@@ -12,9 +12,9 @@ import memory_gym  # noqa
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import tyro
-from einops import rearrange
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
@@ -96,6 +96,12 @@ class Args:
     """the dimension of the transformer"""
     trxl_memory_length: int = 88
     """the length of TrXL's sliding memory window"""
+    parallel_equivalence_check_batches: int = 0
+    """if > 0, run sequential-vs-parallel equivalence checks for this many training minibatches"""
+    parallel_equivalence_atol: float = 1e-5
+    """absolute tolerance for sequential-vs-parallel equivalence checks"""
+    parallel_equivalence_rtol: float = 1e-4
+    """relative tolerance for sequential-vs-parallel equivalence checks"""
 
     # To be filled on runtime
     batch_size: int = 0
@@ -183,16 +189,14 @@ def append_memory_token(state, token, max_episode_steps):
     return state
 
 
-def build_memory_inputs(state, mem_len, max_episode_steps):
+def build_memory_inputs(state, mem_len):
     if state.memory.shape[1] != mem_len:
         raise ValueError(f"State memory length ({state.memory.shape[1]}) does not match `mem_len` ({mem_len})")
 
     device = state.memory.device
     memory_idx = torch.arange(mem_len, device=device, dtype=torch.long).unsqueeze(0)
     memory_mask = memory_idx >= (mem_len - state.valid_len.unsqueeze(1))
-    memory_indices = state.pos.unsqueeze(1) - mem_len + memory_idx
-    memory_indices = torch.clamp(memory_indices, min=0, max=max_episode_steps - 1)
-    return state.memory, memory_mask, memory_indices
+    return state.memory, memory_mask
 
 
 def build_parallel_eval_metadata(dones_seq, init_state, mem_len, max_episode_steps):
@@ -220,9 +224,6 @@ def build_parallel_eval_metadata(dones_seq, init_state, mem_len, max_episode_ste
     memory_valid = m >= (mem_len - init_valid_len.unsqueeze(1))
     memory_pos_unclamped = init_pos.unsqueeze(1) + m - mem_len
 
-    memory_indices = torch.clamp(memory_pos_unclamped, min=0, max=max_episode_steps - 1)
-    query_indices = torch.clamp(query_pos_unclamped, min=0, max=max_episode_steps - 1)
-
     memory_episode_ids = torch.where(memory_valid, torch.zeros_like(memory_pos_unclamped), -torch.ones_like(memory_pos_unclamped))
     memory_key_pos = torch.where(
         memory_valid,
@@ -247,25 +248,24 @@ def build_parallel_eval_metadata(dones_seq, init_state, mem_len, max_episode_ste
     final_valid_len = torch.clamp(final_valid_len, min=0, max=mem_len)
     final_pos = torch.clamp(query_pos_unclamped[:, -1] + 1, min=0, max=max_episode_steps)
 
-    return memory_indices, query_indices, attn_mask, final_valid_len, final_pos
+    return attn_mask, final_valid_len, final_pos
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, dim, min_timescale=2.0, max_timescale=1e4):
-        super().__init__()
-        freqs = torch.arange(0, dim, min_timescale)
-        inv_freqs = max_timescale ** (-freqs / dim)
-        self.register_buffer("inv_freqs", inv_freqs)
-
-    def forward(self, seq_len):
-        seq = torch.arange(seq_len - 1, -1, -1.0, device=self.inv_freqs.device, dtype=self.inv_freqs.dtype)
-        sinusoidal_inp = rearrange(seq, "n -> n ()") * rearrange(self.inv_freqs, "d -> () d")
-        pos_emb = torch.cat((sinusoidal_inp.sin(), sinusoidal_inp.cos()), dim=-1)
-        return pos_emb
+def assert_tensor_allclose(name, actual, expected, atol, rtol):
+    if actual.shape != expected.shape:
+        raise ValueError(
+            f"Equivalence check failed for `{name}`: shape mismatch {tuple(actual.shape)} != {tuple(expected.shape)}"
+        )
+    if not torch.allclose(actual, expected, atol=atol, rtol=rtol):
+        max_abs_diff = (actual - expected).abs().max().item()
+        raise ValueError(
+            f"Equivalence check failed for `{name}`: max_abs_diff={max_abs_diff:.6e} exceeds "
+            f"atol={atol}, rtol={rtol}"
+        )
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi Head Attention without dropout inspired by https://github.com/aladdinpersson/Machine-Learning-Collection"""
+    """Relative Multi Head Attention without dropout."""
 
     def __init__(self, embed_dim, num_heads):
         super().__init__()
@@ -278,9 +278,39 @@ class MultiHeadAttention(nn.Module):
         self.values = nn.Linear(self.head_size, self.head_size, bias=False)
         self.keys = nn.Linear(self.head_size, self.head_size, bias=False)
         self.queries = nn.Linear(self.head_size, self.head_size, bias=False)
+        self.r_proj = nn.Linear(embed_dim, self.num_heads * self.head_size, bias=False)
+        self.u_bias = nn.Parameter(torch.zeros(self.num_heads, self.head_size))
+        self.v_bias = nn.Parameter(torch.zeros(self.num_heads, self.head_size))
+        inv_freqs = 1e4 ** (-torch.arange(0, embed_dim, 2, dtype=torch.float32) / embed_dim)
+        self.register_buffer("inv_freqs", inv_freqs)
         self.fc_out = nn.Linear(self.num_heads * self.head_size, embed_dim)
 
-    def forward(self, values, keys, query, mask):
+    def _relative_sinusoid_embedding(self, num_positions, device, dtype):
+        seq = torch.arange(num_positions, device=device, dtype=self.inv_freqs.dtype).unsqueeze(1)
+        sinusoidal_inp = seq * self.inv_freqs.to(device=device).unsqueeze(0)
+        pos_emb = torch.cat((sinusoidal_inp.sin(), sinusoidal_inp.cos()), dim=-1)
+        if pos_emb.shape[-1] < self.embed_dim:
+            pos_emb = F.pad(pos_emb, (0, self.embed_dim - pos_emb.shape[-1]))
+        elif pos_emb.shape[-1] > self.embed_dim:
+            pos_emb = pos_emb[:, : self.embed_dim]
+        return pos_emb.to(dtype=dtype)
+
+    def _relative_keys(self, query_len, key_len, query_offset, device, dtype):
+        if query_offset is None:
+            query_offset = key_len
+        if query_offset < 0:
+            raise ValueError(f"`query_offset` must be >= 0, got {query_offset}")
+
+        max_distance = key_len + query_len
+        query_positions = torch.arange(query_len, device=device, dtype=torch.long).unsqueeze(1) + query_offset
+        key_positions = torch.arange(key_len, device=device, dtype=torch.long).unsqueeze(0)
+        relative_positions = torch.clamp(query_positions - key_positions, min=0, max=max_distance - 1)
+
+        rel_sinusoid = self._relative_sinusoid_embedding(max_distance, device=device, dtype=dtype)
+        rel_keys = self.r_proj(rel_sinusoid).reshape(max_distance, self.num_heads, self.head_size)
+        return rel_keys[relative_positions]
+
+    def forward(self, values, keys, query, mask, query_offset=None):
         N = query.shape[0]
         value_len, key_len, query_len = values.shape[1], keys.shape[1], query.shape[1]
 
@@ -291,9 +321,18 @@ class MultiHeadAttention(nn.Module):
         values = self.values(values)  # (N, value_len, heads, head_dim)
         keys = self.keys(keys)  # (N, key_len, heads, head_dim)
         queries = self.queries(query)  # (N, query_len, heads, heads_dim)
+        rel_keys = self._relative_keys(
+            query_len=query_len,
+            key_len=key_len,
+            query_offset=query_offset,
+            device=queries.device,
+            dtype=queries.dtype,
+        )
 
-        # Dot-product
-        energy = torch.einsum("nqhd,nkhd->nhqk", [queries, keys])
+        # Relative attention score: q·k + q·r + u·k + v·r
+        content_energy = torch.einsum("nqhd,nkhd->nhqk", [queries + self.u_bias, keys])
+        position_energy = torch.einsum("nqhd,qkhd->nhqk", [queries + self.v_bias, rel_keys])
+        energy = content_energy + position_energy
 
         # Mask padded indices so their attention weights become 0
         if mask is not None:
@@ -306,9 +345,7 @@ class MultiHeadAttention(nn.Module):
             energy = energy.masked_fill(attn_mask == 0, float("-1e20"))  # -inf causes NaN
 
         # Normalize energy values and apply softmax to retrieve the attention scores
-        attention = torch.softmax(
-            energy / (self.embed_dim ** (1 / 2)), dim=3
-        )  # attention shape: (N, heads, query_len, key_len)
+        attention = torch.softmax(energy / (self.head_size ** 0.5), dim=3)  # attention shape: (N, heads, query_len, key_len)
 
         # Scale values by attention weights
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(N, query_len, self.num_heads * self.head_size)
@@ -325,12 +362,12 @@ class TransformerLayer(nn.Module):
         self.layer_norm_attn = nn.LayerNorm(dim)
         self.fc_projection = nn.Sequential(nn.Linear(dim, dim), nn.ReLU())
 
-    def forward(self, value, key, query, mask):
+    def forward(self, value, key, query, mask, query_offset=None):
         # Pre-layer normalization (post-layer normalization is usually less effective)
         query_ = self.layer_norm_q(query)
         value = self.norm_kv(value)
         key = value  # K = V -> self-attention
-        attention, attention_weights = self.attention(value, key, query_, mask)  # MHA
+        attention, attention_weights = self.attention(value, key, query_, mask, query_offset=query_offset)  # MHA
         x = attention + query  # Skip connection
         x_ = self.layer_norm_attn(x)  # Pre-layer normalization
         forward = self.fc_projection(x_)  # Forward projection
@@ -339,43 +376,38 @@ class TransformerLayer(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, num_layers, dim, num_heads, max_episode_steps):
+    def __init__(self, num_layers, dim, num_heads):
         super().__init__()
-        self.max_episode_steps = max_episode_steps
-        self.pos_embedding = PositionalEncoding(dim)
         self.transformer_layers = nn.ModuleList([TransformerLayer(dim, num_heads) for _ in range(num_layers)])
 
-    def forward(self, x, memories, mask, memory_indices, detach_new_memory=True):
-        # Add absolute positional encoding to every transformer layer input
-        pos_embedding = self.pos_embedding(self.max_episode_steps)[memory_indices]
-        memories = memories + pos_embedding.unsqueeze(2)
-
+    def forward(self, x, memories, mask, detach_new_memory=True):
         # Forward transformer layers and return new memories (i.e. hidden states)
         out_memories = []
         for i, layer in enumerate(self.transformer_layers):
             out_memories.append(x.detach() if detach_new_memory else x)
             x, attention_weights = layer(
-                memories[:, :, i], memories[:, :, i], x.unsqueeze(1), mask
+                memories[:, :, i],
+                memories[:, :, i],
+                x.unsqueeze(1),
+                mask,
+                query_offset=memories.shape[1],
             )  # args: value, key, query, mask
             x = x.squeeze()
             if len(x.shape) == 1:
                 x = x.unsqueeze(0)
         return x, torch.stack(out_memories, dim=1)
 
-    def forward_sequence(self, x_seq, memories, mask, memory_indices, query_indices, detach_new_memory=True):
+    def forward_sequence(self, x_seq, memories, mask, detach_new_memory=True):
         if x_seq.ndim != 3:
             raise ValueError(f"`x_seq` must be rank-3 [B, T, D], got shape={tuple(x_seq.shape)}")
 
-        pos_embedding = self.pos_embedding(self.max_episode_steps)
-        memory_pos_embedding = pos_embedding[memory_indices]
-        query_pos_embedding = pos_embedding[query_indices]
-        fallback_kv_token = pos_embedding[0]
+        fallback_kv_token = torch.zeros(1, 1, x_seq.shape[-1], dtype=x_seq.dtype, device=x_seq.device)
 
         x = x_seq
         layer_inputs = []
         for i, layer in enumerate(self.transformer_layers):
             layer_inputs.append(x.detach() if detach_new_memory else x)
-            kv = torch.cat((memories[:, :, i] + memory_pos_embedding, x + query_pos_embedding), dim=1)
+            kv = torch.cat((memories[:, :, i], x), dim=1)
             layer_mask = mask
             if layer_mask is not None:
                 no_key_rows = ~layer_mask.any(dim=2, keepdim=True)
@@ -385,7 +417,13 @@ class Transformer(nn.Module):
                 )
                 kv = torch.cat((dummy_kv, kv), dim=1)
                 layer_mask = torch.cat((no_key_rows, layer_mask), dim=2)
-            x, attention_weights = layer(kv, kv, x, layer_mask)  # args: value, key, query, mask
+            x, attention_weights = layer(
+                kv,
+                kv,
+                x,
+                layer_mask,
+                query_offset=kv.shape[1] - x.shape[1],
+            )  # args: value, key, query, mask
             del attention_weights
         return x, torch.stack(layer_inputs, dim=2)
 
@@ -411,7 +449,7 @@ class Agent(nn.Module):
         else:
             self.encoder = layer_init(nn.Linear(observation_space.shape[0], args.trxl_dim))
 
-        self.transformer = Transformer(args.trxl_num_layers, args.trxl_dim, args.trxl_num_heads, self.max_episode_steps)
+        self.transformer = Transformer(args.trxl_num_layers, args.trxl_dim, args.trxl_num_heads)
 
         self.hidden_post_trxl = nn.Sequential(
             layer_init(nn.Linear(args.trxl_dim, args.trxl_dim)),
@@ -421,16 +459,16 @@ class Agent(nn.Module):
         self.actor = layer_init(nn.Linear(args.trxl_dim, out_features=action_dim), np.sqrt(0.01))
         self.critic = layer_init(nn.Linear(args.trxl_dim, 1), 1)
 
-    def get_value(self, x, memory, memory_mask, memory_indices, detach_new_memory=True):
+    def get_value(self, x, memory, memory_mask, detach_new_memory=True):
         if len(self.obs_shape) > 1:
             x = self.encoder(x.permute((0, 3, 1, 2)) / 255.0)
         else:
             x = self.encoder(x)
-        x, _ = self.transformer(x, memory, memory_mask, memory_indices, detach_new_memory=detach_new_memory)
+        x, _ = self.transformer(x, memory, memory_mask, detach_new_memory=detach_new_memory)
         x = self.hidden_post_trxl(x)
         return self.critic(x).flatten()
 
-    def get_action_and_value(self, x, memory, memory_mask, memory_indices, action=None, detach_new_memory=True):
+    def get_action_and_value(self, x, memory, memory_mask, action=None, detach_new_memory=True):
         if len(self.obs_shape) > 1:
             x = self.encoder(x.permute((0, 3, 1, 2)) / 255.0)
         else:
@@ -439,7 +477,6 @@ class Agent(nn.Module):
             x,
             memory,
             memory_mask,
-            memory_indices,
             detach_new_memory=detach_new_memory,
         )
         x = self.hidden_post_trxl(x)
@@ -450,12 +487,38 @@ class Agent(nn.Module):
         entropies = probs.entropy()
         return action, log_probs, entropies, self.critic(x).flatten(), memory
 
-    def evaluate_segment(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
+    def evaluate_segment_sequential(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
+        seq_len = obs_seq.shape[0]
+        state = clone_trxl_state(init_state, device=obs_seq.device)
+        new_log_probs = []
+        entropies = []
+        values = []
+
+        for t in range(seq_len):
+            state = reset_done_in_state(state, dones_seq[t].bool())
+            memory_window, memory_mask = build_memory_inputs(state, state.memory.shape[1])
+            _, new_log_prob, entropy, value, new_memory = self.get_action_and_value(
+                obs_seq[t],
+                memory_window,
+                memory_mask,
+                action=actions_seq[t],
+                detach_new_memory=False,
+            )
+            state = append_memory_token(state, new_memory, max_episode_steps)
+            new_log_probs.append(new_log_prob)
+            entropies.append(entropy)
+            values.append(value)
+
+        return (
+            torch.stack(new_log_probs, dim=0),
+            torch.stack(entropies, dim=0),
+            torch.stack(values, dim=0),
+        )
+
+    def evaluate_segment_parallel(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
         seq_len, batch_size = obs_seq.shape[0], obs_seq.shape[1]
         state = clone_trxl_state(init_state, device=obs_seq.device)
-        memory_indices, query_indices, attn_mask, _, _ = build_parallel_eval_metadata(
-            dones_seq, state, state.memory.shape[1], max_episode_steps
-        )
+        attn_mask, _, _ = build_parallel_eval_metadata(dones_seq, state, state.memory.shape[1], max_episode_steps)
 
         if len(self.obs_shape) > 1:
             obs_flat = obs_seq.reshape(seq_len * batch_size, *obs_seq.shape[2:])
@@ -469,8 +532,6 @@ class Agent(nn.Module):
             x_seq,
             state.memory,
             attn_mask,
-            memory_indices,
-            query_indices,
             detach_new_memory=False,
         )
         del layer_inputs
@@ -487,6 +548,9 @@ class Agent(nn.Module):
 
         return new_log_probs, entropies, values
 
+    def evaluate_segment(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
+        return self.evaluate_segment_parallel(obs_seq, actions_seq, dones_seq, init_state, max_episode_steps)
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -498,6 +562,14 @@ if __name__ == "__main__":
         raise ValueError(f"`num_envs` ({args.num_envs}) must be divisible by `num_minibatches` ({args.num_minibatches})")
     if args.trxl_memory_length <= 0:
         raise ValueError(f"`trxl_memory_length` must be > 0, got {args.trxl_memory_length}")
+    if args.parallel_equivalence_check_batches < 0:
+        raise ValueError(
+            f"`parallel_equivalence_check_batches` must be >= 0, got {args.parallel_equivalence_check_batches}"
+        )
+    if args.parallel_equivalence_atol < 0:
+        raise ValueError(f"`parallel_equivalence_atol` must be >= 0, got {args.parallel_equivalence_atol}")
+    if args.parallel_equivalence_rtol < 0:
+        raise ValueError(f"`parallel_equivalence_rtol` must be >= 0, got {args.parallel_equivalence_rtol}")
 
     args.batch_size = int(args.num_envs * args.num_steps)
     args.num_segments = int(args.num_steps // args.segment_length)
@@ -619,14 +691,11 @@ if __name__ == "__main__":
 
                 obs[step] = next_obs
                 dones[step] = next_done
-                memory_window, memory_mask, memory_indices = build_memory_inputs(
-                    rollout_state, args.trxl_memory_length, max_episode_steps
-                )
+                memory_window, memory_mask = build_memory_inputs(rollout_state, args.trxl_memory_length)
                 action, logprob, _, value, new_memory = get_action_and_value(
                     next_obs,
                     memory_window,
                     memory_mask,
-                    memory_indices,
                     detach_new_memory=True,
                 )
                 rollout_state = append_memory_token(rollout_state, new_memory, max_episode_steps)
@@ -649,14 +718,11 @@ if __name__ == "__main__":
         with torch.no_grad():
             bootstrap_state = clone_trxl_state(rollout_state, device=device)
             bootstrap_state = reset_done_in_state(bootstrap_state, next_done.bool())
-            memory_window, memory_mask, memory_indices = build_memory_inputs(
-                bootstrap_state, args.trxl_memory_length, max_episode_steps
-            )
+            memory_window, memory_mask = build_memory_inputs(bootstrap_state, args.trxl_memory_length)
             next_value = agent.get_value(
                 next_obs,
                 memory_window,
                 memory_mask,
-                memory_indices,
             )
             advantages = torch.zeros_like(rewards, device=device)
             lastgaelam = torch.zeros((args.num_envs,), dtype=torch.float32, device=device)
@@ -689,6 +755,7 @@ if __name__ == "__main__":
         entropy_values = []
         total_loss_values = []
         early_stop = False
+        equivalence_checks_done = 0
         for epoch in range(args.update_epochs):
             env_perm = torch.randperm(args.num_envs, device="cpu")
             for mb_start in range(0, args.num_envs, args.envs_per_minibatch):
@@ -713,6 +780,36 @@ if __name__ == "__main__":
                     newlogprob, entropy, newvalue = evaluate_segment(
                         mb_obs, mb_actions, mb_dones, mb_init_state, max_episode_steps
                     )
+                    if (
+                        args.parallel_equivalence_check_batches > 0
+                        and equivalence_checks_done < args.parallel_equivalence_check_batches
+                    ):
+                        with torch.no_grad():
+                            ref_newlogprob, ref_entropy, ref_newvalue = agent.evaluate_segment_sequential(
+                                mb_obs, mb_actions, mb_dones, mb_init_state, max_episode_steps
+                            )
+                        assert_tensor_allclose(
+                            "newlogprob",
+                            newlogprob,
+                            ref_newlogprob,
+                            args.parallel_equivalence_atol,
+                            args.parallel_equivalence_rtol,
+                        )
+                        assert_tensor_allclose(
+                            "entropy",
+                            entropy,
+                            ref_entropy,
+                            args.parallel_equivalence_atol,
+                            args.parallel_equivalence_rtol,
+                        )
+                        assert_tensor_allclose(
+                            "newvalue",
+                            newvalue,
+                            ref_newvalue,
+                            args.parallel_equivalence_atol,
+                            args.parallel_equivalence_rtol,
+                        )
+                        equivalence_checks_done += 1
 
                     flat_advantages = mb_advantages.reshape(-1)
                     if args.norm_adv:
