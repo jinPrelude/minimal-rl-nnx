@@ -1,6 +1,14 @@
 """
-TrXL based on CleanRL implementation, but training logic is changed (segment wise learning).
+TrXL-based PPO with segment-wise training.
+
+Implements Proximal Policy Optimization (PPO) with a Transformer-XL (TrXL) backbone
+for partially observable / memory-dependent environments. Training uses truncated
+backpropagation through time (TBPTT) over fixed-length segments, with a sliding
+memory window that carries hidden states across segment boundaries.
+
+Based on the CleanRL implementation style.
 """
+
 import os
 import random
 import time
@@ -96,12 +104,6 @@ class Args:
     """the dimension of the transformer"""
     trxl_memory_length: int = 88
     """the length of TrXL's sliding memory window"""
-    parallel_equivalence_check_batches: int = 0
-    """if > 0, run sequential-vs-parallel equivalence checks for this many training minibatches"""
-    parallel_equivalence_atol: float = 1e-5
-    """absolute tolerance for sequential-vs-parallel equivalence checks"""
-    parallel_equivalence_rtol: float = 1e-4
-    """relative tolerance for sequential-vs-parallel equivalence checks"""
 
     # To be filled on runtime
     batch_size: int = 0
@@ -137,131 +139,121 @@ def make_env(env_id, idx, capture_video, run_name, render_mode="debug_rgb_array"
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
-    # torch.nn.init.constant_(layer.bias, bias_const)
     return layer
+
+
+# ---------------------------------------------------------------------------
+# TrXL memory state
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class TrXLState:
-    memory: torch.Tensor
-    valid_len: torch.Tensor
-    pos: torch.Tensor
+    memory: torch.Tensor  # [B, M, num_layers, dim]
+    valid_len: torch.Tensor  # [B]
+    pos: torch.Tensor  # [B]
 
-
-def init_trxl_state(num_envs, mem_len, num_layers, dim, device):
-    return TrXLState(
-        memory=torch.zeros((num_envs, mem_len, num_layers, dim), dtype=torch.float32, device=device),
-        valid_len=torch.zeros((num_envs,), dtype=torch.long, device=device),
-        pos=torch.zeros((num_envs,), dtype=torch.long, device=device),
-    )
-
-
-def clone_trxl_state(state, device=None):
-    if device is None:
-        device = state.memory.device
-    return TrXLState(
-        memory=state.memory.to(device).clone(),
-        valid_len=state.valid_len.to(device).clone(),
-        pos=state.pos.to(device).clone(),
-    )
-
-
-def reset_done_in_state(state, done_mask):
-    done_mask = done_mask.to(device=state.memory.device, dtype=torch.bool)
-    if done_mask.ndim != 1:
-        raise ValueError(f"`done_mask` must be rank-1 [num_envs], got shape={tuple(done_mask.shape)}")
-
-    keep_mask = (~done_mask).view(-1, 1, 1, 1)
-    state.memory = torch.where(keep_mask, state.memory, torch.zeros_like(state.memory))
-    state.valid_len = torch.where(done_mask, torch.zeros_like(state.valid_len), state.valid_len)
-    state.pos = torch.where(done_mask, torch.zeros_like(state.pos), state.pos)
-    return state
-
-
-def append_memory_token(state, token, max_episode_steps):
-    if token.ndim != 3:
-        raise ValueError(f"`token` must be rank-3 [num_envs, num_layers, dim], got shape={tuple(token.shape)}")
-    mem_len = state.memory.shape[1]
-    token = token.to(state.memory.device)
-    state.memory = torch.cat((state.memory[:, 1:], token.unsqueeze(1)), dim=1)
-    state.valid_len = torch.clamp(state.valid_len + 1, max=mem_len)
-    state.pos = torch.clamp(state.pos + 1, max=max_episode_steps)
-    return state
-
-
-def build_memory_inputs(state, mem_len):
-    if state.memory.shape[1] != mem_len:
-        raise ValueError(f"State memory length ({state.memory.shape[1]}) does not match `mem_len` ({mem_len})")
-
-    device = state.memory.device
-    memory_idx = torch.arange(mem_len, device=device, dtype=torch.long).unsqueeze(0)
-    memory_mask = memory_idx >= (mem_len - state.valid_len.unsqueeze(1))
-    return state.memory, memory_mask
-
-
-def build_parallel_eval_metadata(dones_seq, init_state, mem_len, max_episode_steps):
-    if dones_seq.ndim != 2:
-        raise ValueError(f"`dones_seq` must be rank-2 [T, B], got shape={tuple(dones_seq.shape)}")
-    if max_episode_steps <= 0:
-        raise ValueError(f"`max_episode_steps` must be > 0, got {max_episode_steps}")
-    if mem_len <= 0:
-        raise ValueError(f"`mem_len` must be > 0, got {mem_len}")
-
-    done = dones_seq.to(dtype=torch.bool, device=init_state.pos.device).transpose(0, 1)  # [B, T]
-    batch_size, seq_len = done.shape
-    device = done.device
-
-    t = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)  # [1, T]
-    m = torch.arange(mem_len, device=device, dtype=torch.long).unsqueeze(0)  # [1, M]
-    init_pos = init_state.pos.to(device=device, dtype=torch.long)
-    init_valid_len = init_state.valid_len.to(device=device, dtype=torch.long)
-
-    episode_ids = torch.cumsum(done.to(torch.long), dim=1)  # [B, T]
-    reset_points = torch.where(done, t.expand(batch_size, -1), -torch.ones((batch_size, seq_len), dtype=torch.long, device=device))
-    last_reset = torch.cummax(reset_points, dim=1).values
-    query_pos_unclamped = torch.where(episode_ids == 0, init_pos.unsqueeze(1) + t, t.expand(batch_size, -1) - last_reset)
-
-    memory_valid = m >= (mem_len - init_valid_len.unsqueeze(1))
-    memory_pos_unclamped = init_pos.unsqueeze(1) + m - mem_len
-
-    memory_episode_ids = torch.where(memory_valid, torch.zeros_like(memory_pos_unclamped), -torch.ones_like(memory_pos_unclamped))
-    memory_key_pos = torch.where(
-        memory_valid,
-        memory_pos_unclamped,
-        torch.full_like(memory_pos_unclamped, fill_value=-1_000_000_000),
-    )
-    key_episode_ids = torch.cat((memory_episode_ids, episode_ids), dim=1)  # [B, M+T]
-    key_pos = torch.cat((memory_key_pos, query_pos_unclamped), dim=1)  # [B, M+T]
-
-    query_pos = query_pos_unclamped.unsqueeze(2)  # [B, T, 1]
-    attn_mask = (
-        (key_episode_ids.unsqueeze(1) == episode_ids.unsqueeze(2))
-        & (key_pos.unsqueeze(1) < query_pos)
-        & (key_pos.unsqueeze(1) >= query_pos - mem_len)
-    )
-
-    final_valid_len = torch.where(
-        episode_ids[:, -1] == 0,
-        init_valid_len + seq_len,
-        seq_len - last_reset[:, -1],
-    )
-    final_valid_len = torch.clamp(final_valid_len, min=0, max=mem_len)
-    final_pos = torch.clamp(query_pos_unclamped[:, -1] + 1, min=0, max=max_episode_steps)
-
-    return attn_mask, final_valid_len, final_pos
-
-
-def assert_tensor_allclose(name, actual, expected, atol, rtol):
-    if actual.shape != expected.shape:
-        raise ValueError(
-            f"Equivalence check failed for `{name}`: shape mismatch {tuple(actual.shape)} != {tuple(expected.shape)}"
+    @classmethod
+    def zeros(cls, num_envs, mem_len, num_layers, dim, device):
+        return cls(
+            memory=torch.zeros((num_envs, mem_len, num_layers, dim), dtype=torch.float32, device=device),
+            valid_len=torch.zeros((num_envs,), dtype=torch.long, device=device),
+            pos=torch.zeros((num_envs,), dtype=torch.long, device=device),
         )
-    if not torch.allclose(actual, expected, atol=atol, rtol=rtol):
-        max_abs_diff = (actual - expected).abs().max().item()
-        raise ValueError(
-            f"Equivalence check failed for `{name}`: max_abs_diff={max_abs_diff:.6e} exceeds "
-            f"atol={atol}, rtol={rtol}"
+
+    def clone(self, device=None):
+        device = device or self.memory.device
+        return TrXLState(
+            memory=self.memory.to(device).clone(),
+            valid_len=self.valid_len.to(device).clone(),
+            pos=self.pos.to(device).clone(),
         )
+
+    def reset_done(self, done_mask):
+        done_mask = done_mask.to(device=self.memory.device, dtype=torch.bool)
+        if done_mask.ndim != 1:
+            raise ValueError(f"`done_mask` must be rank-1 [num_envs], got shape={tuple(done_mask.shape)}")
+
+        keep_mask = (~done_mask).view(-1, 1, 1, 1)
+        self.memory = torch.where(keep_mask, self.memory, torch.zeros_like(self.memory))
+        self.valid_len = torch.where(done_mask, torch.zeros_like(self.valid_len), self.valid_len)
+        self.pos = torch.where(done_mask, torch.zeros_like(self.pos), self.pos)
+        return self
+
+    def append_memory(self, token, max_episode_steps):
+        if token.ndim != 3:
+            raise ValueError(f"`token` must be rank-3 [num_envs, num_layers, dim], got shape={tuple(token.shape)}")
+        mem_len = self.memory.shape[1]
+        token = token.to(self.memory.device)
+        self.memory = torch.cat((self.memory[:, 1:], token.unsqueeze(1)), dim=1)
+        self.valid_len = torch.clamp(self.valid_len + 1, max=mem_len)
+        self.pos = torch.clamp(self.pos + 1, max=max_episode_steps)
+        return self
+
+    def memory_inputs(self):
+        mem_len = self.memory.shape[1]
+        device = self.memory.device
+        idx = torch.arange(mem_len, device=device, dtype=torch.long).unsqueeze(0)
+        mask = idx >= (mem_len - self.valid_len.unsqueeze(1))
+        return self.memory, mask
+
+    @staticmethod
+    def parallel_eval_metadata(dones_seq, init_state, mem_len, max_episode_steps):
+        """Compute attention mask and final-state metadata for parallel segment evaluation."""
+        if dones_seq.ndim != 2:
+            raise ValueError(f"`dones_seq` must be rank-2 [T, B], got shape={tuple(dones_seq.shape)}")
+        if max_episode_steps <= 0:
+            raise ValueError(f"`max_episode_steps` must be > 0, got {max_episode_steps}")
+        if mem_len <= 0:
+            raise ValueError(f"`mem_len` must be > 0, got {mem_len}")
+
+        done = dones_seq.to(dtype=torch.bool, device=init_state.pos.device).transpose(0, 1)  # [B, T]
+        batch_size, seq_len = done.shape
+        device = done.device
+
+        t = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)  # [1, T]
+        m = torch.arange(mem_len, device=device, dtype=torch.long).unsqueeze(0)  # [1, M]
+        init_pos = init_state.pos.to(device=device, dtype=torch.long)
+        init_valid_len = init_state.valid_len.to(device=device, dtype=torch.long)
+
+        episode_ids = torch.cumsum(done.to(torch.long), dim=1)  # [B, T]
+        reset_points = torch.where(done, t.expand(batch_size, -1), -torch.ones((batch_size, seq_len), dtype=torch.long, device=device))
+        last_reset = torch.cummax(reset_points, dim=1).values
+        query_pos_unclamped = torch.where(episode_ids == 0, init_pos.unsqueeze(1) + t, t.expand(batch_size, -1) - last_reset)
+
+        memory_valid = m >= (mem_len - init_valid_len.unsqueeze(1))
+        memory_pos_unclamped = init_pos.unsqueeze(1) + m - mem_len
+
+        memory_episode_ids = torch.where(memory_valid, torch.zeros_like(memory_pos_unclamped), -torch.ones_like(memory_pos_unclamped))
+        memory_key_pos = torch.where(
+            memory_valid,
+            memory_pos_unclamped,
+            torch.full_like(memory_pos_unclamped, fill_value=-1_000_000_000),
+        )
+        key_episode_ids = torch.cat((memory_episode_ids, episode_ids), dim=1)  # [B, M+T]
+        key_pos = torch.cat((memory_key_pos, query_pos_unclamped), dim=1)  # [B, M+T]
+
+        query_pos = query_pos_unclamped.unsqueeze(2)  # [B, T, 1]
+        attn_mask = (
+            (key_episode_ids.unsqueeze(1) == episode_ids.unsqueeze(2))
+            & (key_pos.unsqueeze(1) < query_pos)
+            & (key_pos.unsqueeze(1) >= query_pos - mem_len)
+        )
+
+        final_valid_len = torch.where(
+            episode_ids[:, -1] == 0,
+            init_valid_len + seq_len,
+            seq_len - last_reset[:, -1],
+        )
+        final_valid_len = torch.clamp(final_valid_len, min=0, max=mem_len)
+        final_pos = torch.clamp(query_pos_unclamped[:, -1] + 1, min=0, max=max_episode_steps)
+
+        return attn_mask, final_valid_len, final_pos
+
+
+# ---------------------------------------------------------------------------
+# Transformer-XL architecture
+# ---------------------------------------------------------------------------
 
 
 class MultiHeadAttention(nn.Module):
@@ -334,7 +326,6 @@ class MultiHeadAttention(nn.Module):
         position_energy = torch.einsum("nqhd,qkhd->nhqk", [queries + self.v_bias, rel_keys])
         energy = content_energy + position_energy
 
-        # Mask padded indices so their attention weights become 0
         if mask is not None:
             if mask.ndim == 2:
                 attn_mask = mask.unsqueeze(1).unsqueeze(1)
@@ -342,12 +333,9 @@ class MultiHeadAttention(nn.Module):
                 attn_mask = mask.unsqueeze(1)
             else:
                 raise ValueError(f"`mask` must be rank-2 [B, K] or rank-3 [B, Q, K], got rank={mask.ndim}")
-            energy = energy.masked_fill(attn_mask == 0, float("-1e20"))  # -inf causes NaN
+            energy = energy.masked_fill(attn_mask == 0, float("-1e20"))
 
-        # Normalize energy values and apply softmax to retrieve the attention scores
-        attention = torch.softmax(energy / (self.head_size ** 0.5), dim=3)  # attention shape: (N, heads, query_len, key_len)
-
-        # Scale values by attention weights
+        attention = torch.softmax(energy / (self.head_size ** 0.5), dim=3)
         out = torch.einsum("nhql,nlhd->nqhd", [attention, values]).reshape(N, query_len, self.num_heads * self.head_size)
 
         return self.fc_out(out), attention
@@ -363,14 +351,13 @@ class TransformerLayer(nn.Module):
         self.fc_projection = nn.Sequential(nn.Linear(dim, dim), nn.ReLU())
 
     def forward(self, value, key, query, mask, query_offset=None):
-        # Pre-layer normalization (post-layer normalization is usually less effective)
         query_ = self.layer_norm_q(query)
         value = self.norm_kv(value)
         key = value  # K = V -> self-attention
-        attention, attention_weights = self.attention(value, key, query_, mask, query_offset=query_offset)  # MHA
+        attention, attention_weights = self.attention(value, key, query_, mask, query_offset=query_offset)
         x = attention + query  # Skip connection
-        x_ = self.layer_norm_attn(x)  # Pre-layer normalization
-        forward = self.fc_projection(x_)  # Forward projection
+        x_ = self.layer_norm_attn(x)
+        forward = self.fc_projection(x_)
         out = forward + x  # Skip connection
         return out, attention_weights
 
@@ -381,7 +368,7 @@ class Transformer(nn.Module):
         self.transformer_layers = nn.ModuleList([TransformerLayer(dim, num_heads) for _ in range(num_layers)])
 
     def forward(self, x, memories, mask, detach_new_memory=True):
-        # Forward transformer layers and return new memories (i.e. hidden states)
+        """Process a single timestep query [B, D] against the memory window [B, M, L, D]."""
         out_memories = []
         for i, layer in enumerate(self.transformer_layers):
             out_memories.append(x.detach() if detach_new_memory else x)
@@ -391,13 +378,24 @@ class Transformer(nn.Module):
                 x.unsqueeze(1),
                 mask,
                 query_offset=memories.shape[1],
-            )  # args: value, key, query, mask
+            )
             x = x.squeeze()
             if len(x.shape) == 1:
                 x = x.unsqueeze(0)
         return x, torch.stack(out_memories, dim=1)
 
     def forward_sequence(self, x_seq, memories, mask, detach_new_memory=True):
+        """Process an entire segment [B, T, D] against memory+self KV in parallel.
+
+        Unlike ``forward`` (single-step), this concatenates memory and sequence tokens
+        into a single KV context [B, M+T, D] with a 3D attention mask [B, T, M+T].
+
+        A zero-valued "fallback" KV token is always prepended so that every query row
+        has at least one key even when the mask is all-False (e.g., first step of a new
+        episode with empty memory). This keeps the computation graph static for
+        torch.compile compatibility. The fallback token's attention output is effectively
+        zero and does not change results.
+        """
         if x_seq.ndim != 3:
             raise ValueError(f"`x_seq` must be rank-3 [B, T, D], got shape={tuple(x_seq.shape)}")
 
@@ -411,7 +409,6 @@ class Transformer(nn.Module):
             layer_mask = mask
             if layer_mask is not None:
                 no_key_rows = ~layer_mask.any(dim=2, keepdim=True)
-                # Always prepend a fallback key to avoid data-dependent graph breaks in torch.compile.
                 dummy_kv = fallback_kv_token.to(dtype=kv.dtype, device=kv.device).view(1, 1, -1).expand(
                     kv.shape[0], 1, kv.shape[2]
                 )
@@ -423,9 +420,14 @@ class Transformer(nn.Module):
                 x,
                 layer_mask,
                 query_offset=kv.shape[1] - x.shape[1],
-            )  # args: value, key, query, mask
+            )
             del attention_weights
         return x, torch.stack(layer_inputs, dim=2)
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
 
 
 class Agent(nn.Module):
@@ -487,38 +489,10 @@ class Agent(nn.Module):
         entropies = probs.entropy()
         return action, log_probs, entropies, self.critic(x).flatten(), memory
 
-    def evaluate_segment_sequential(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
-        seq_len = obs_seq.shape[0]
-        state = clone_trxl_state(init_state, device=obs_seq.device)
-        new_log_probs = []
-        entropies = []
-        values = []
-
-        for t in range(seq_len):
-            state = reset_done_in_state(state, dones_seq[t].bool())
-            memory_window, memory_mask = build_memory_inputs(state, state.memory.shape[1])
-            _, new_log_prob, entropy, value, new_memory = self.get_action_and_value(
-                obs_seq[t],
-                memory_window,
-                memory_mask,
-                action=actions_seq[t],
-                detach_new_memory=False,
-            )
-            state = append_memory_token(state, new_memory, max_episode_steps)
-            new_log_probs.append(new_log_prob)
-            entropies.append(entropy)
-            values.append(value)
-
-        return (
-            torch.stack(new_log_probs, dim=0),
-            torch.stack(entropies, dim=0),
-            torch.stack(values, dim=0),
-        )
-
-    def evaluate_segment_parallel(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
+    def evaluate_segment(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
         seq_len, batch_size = obs_seq.shape[0], obs_seq.shape[1]
-        state = clone_trxl_state(init_state, device=obs_seq.device)
-        attn_mask, _, _ = build_parallel_eval_metadata(dones_seq, state, state.memory.shape[1], max_episode_steps)
+        state = init_state.clone(device=obs_seq.device)
+        attn_mask, _, _ = TrXLState.parallel_eval_metadata(dones_seq, state, state.memory.shape[1], max_episode_steps)
 
         if len(self.obs_shape) > 1:
             obs_flat = obs_seq.reshape(seq_len * batch_size, *obs_seq.shape[2:])
@@ -548,9 +522,253 @@ class Agent(nn.Module):
 
         return new_log_probs, entropies, values
 
-    def evaluate_segment(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
-        return self.evaluate_segment_parallel(obs_seq, actions_seq, dones_seq, init_state, max_episode_steps)
 
+# ---------------------------------------------------------------------------
+# Training helper functions
+# ---------------------------------------------------------------------------
+
+
+def anneal_schedule(args, global_step):
+    """Linearly anneal LR and entropy coefficient from initial to final values."""
+    do_anneal = args.anneal_steps > 0 and global_step < args.anneal_steps
+    frac = 1 - global_step / args.anneal_steps if do_anneal else 0
+    lr = (args.init_lr - args.final_lr) * frac + args.final_lr
+    ent_coef = (args.init_ent_coef - args.final_ent_coef) * frac + args.final_ent_coef
+    return lr, ent_coef
+
+
+def collect_rollout(
+    envs, get_action_and_value, rollout_state, args,
+    obs, dones, actions, log_probs, values, rewards,
+    segment_init_memory, segment_init_valid_len, segment_init_pos,
+    next_obs, next_done, max_episode_steps, device,
+):
+    """Run num_steps environment interactions, storing data in pre-allocated buffers.
+
+    Returns (next_obs, next_done, rollout_state, total_steps, episode_infos).
+    """
+    sampled_episode_infos = []
+
+    for step in range(args.num_steps):
+        with torch.no_grad():
+            rollout_state.reset_done(next_done.bool())
+            if step % args.segment_length == 0:
+                segment_id = step // args.segment_length
+                segment_init_memory[segment_id] = rollout_state.memory.detach().cpu()
+                segment_init_valid_len[segment_id] = rollout_state.valid_len.detach().cpu()
+                segment_init_pos[segment_id] = rollout_state.pos.detach().cpu()
+
+            obs[step] = next_obs
+            dones[step] = next_done
+            memory_window, memory_mask = rollout_state.memory_inputs()
+            action, logprob, _, value, new_memory = get_action_and_value(
+                next_obs,
+                memory_window,
+                memory_mask,
+                detach_new_memory=True,
+            )
+            rollout_state.append_memory(new_memory, max_episode_steps)
+            actions[step], log_probs[step], values[step] = action, logprob, value
+
+        next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+        next_done = np.maximum(terminations, truncations).astype(np.float32)
+        rewards[step] = torch.tensor(reward, dtype=torch.float32, device=device).view(-1)
+        next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+        next_done = torch.tensor(next_done, dtype=torch.float32, device=device)
+
+        if "_episode" in infos and "episode" in infos:
+            finished = np.asarray(infos["_episode"], dtype=bool)
+            for i in np.where(finished)[0]:
+                sampled_episode_infos.append({k: infos["episode"][k][i] for k in infos["episode"]})
+
+    return next_obs, next_done, rollout_state, args.num_steps * args.num_envs, sampled_episode_infos
+
+
+def compute_gae(agent, next_obs, next_done, rollout_state, rewards, dones, values, args, max_episode_steps, device):
+    """Compute GAE advantages and returns using the bootstrap value."""
+    with torch.no_grad():
+        bootstrap_state = rollout_state.clone(device=device)
+        bootstrap_state.reset_done(next_done.bool())
+        memory_window, memory_mask = bootstrap_state.memory_inputs()
+        next_value = agent.get_value(next_obs, memory_window, memory_mask)
+        advantages = torch.zeros_like(rewards, device=device)
+        lastgaelam = torch.zeros((args.num_envs,), dtype=torch.float32, device=device)
+        for t in reversed(range(args.num_steps)):
+            if t == args.num_steps - 1:
+                nextnonterminal = 1.0 - next_done
+                nextvalues = next_value
+            else:
+                nextnonterminal = 1.0 - dones[t + 1]
+                nextvalues = values[t + 1]
+            delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+            lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+            advantages[t] = lastgaelam
+        returns = advantages + values
+    return advantages, returns
+
+
+def ppo_update(
+    agent, evaluate_segment_fn, optimizer, args, ent_coef,
+    segment_obs, segment_dones, segment_actions, segment_old_log_probs,
+    segment_advantages, segment_returns, segment_old_values,
+    segment_init_memory, segment_init_valid_len, segment_init_pos,
+    max_episode_steps, device,
+):
+    """Run update_epochs of PPO over segments, with optional early stopping on KL.
+
+    Returns a dict of aggregated loss metrics.
+    """
+    clipfracs = []
+    old_approx_kl_values = []
+    approx_kl_values = []
+    pg_loss_values = []
+    v_loss_values = []
+    entropy_values = []
+    total_loss_values = []
+    early_stop = False
+
+    for epoch in range(args.update_epochs):
+        env_perm = torch.randperm(args.num_envs, device="cpu")
+        for mb_start in range(0, args.num_envs, args.envs_per_minibatch):
+            mb_end = mb_start + args.envs_per_minibatch
+            env_ids_cpu = env_perm[mb_start:mb_end]
+            env_ids = env_ids_cpu.to(device)
+
+            for seg_id in range(args.num_segments):
+                mb_obs = segment_obs[seg_id, :, env_ids]
+                mb_dones = segment_dones[seg_id, :, env_ids]
+                mb_actions = segment_actions[seg_id, :, env_ids]
+                mb_old_log_probs = segment_old_log_probs[seg_id, :, env_ids]
+                mb_advantages = segment_advantages[seg_id, :, env_ids]
+                mb_returns = segment_returns[seg_id, :, env_ids]
+                mb_old_values = segment_old_values[seg_id, :, env_ids]
+                mb_init_state = TrXLState(
+                    memory=segment_init_memory[seg_id, env_ids_cpu].to(device),
+                    valid_len=segment_init_valid_len[seg_id, env_ids_cpu].to(device),
+                    pos=segment_init_pos[seg_id, env_ids_cpu].to(device),
+                )
+
+                newlogprob, entropy, newvalue = evaluate_segment_fn(
+                    mb_obs, mb_actions, mb_dones, mb_init_state, max_episode_steps
+                )
+
+                flat_advantages = mb_advantages.reshape(-1)
+                if args.norm_adv:
+                    flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
+                flat_newlogprob = newlogprob.reshape(-1)
+                flat_old_log_probs = mb_old_log_probs.reshape(-1)
+                logratio = flat_newlogprob - flat_old_log_probs
+                ratio = torch.exp(logratio)
+                pgloss1 = -flat_advantages * ratio
+                pgloss2 = -flat_advantages * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
+                pg_loss = torch.max(pgloss1, pgloss2).mean()
+
+                flat_newvalue = newvalue.reshape(-1)
+                flat_returns = mb_returns.reshape(-1)
+                flat_old_values = mb_old_values.reshape(-1)
+                v_loss_unclipped = (flat_newvalue - flat_returns) ** 2
+                if args.clip_vloss:
+                    v_loss_clipped = flat_old_values + (flat_newvalue - flat_old_values).clamp(
+                        min=-args.clip_coef, max=args.clip_coef
+                    )
+                    v_loss = torch.max(v_loss_unclipped, (v_loss_clipped - flat_returns) ** 2).mean()
+                else:
+                    v_loss = v_loss_unclipped.mean()
+
+                entropy_loss = entropy.reshape(-1).mean()
+                loss = pg_loss - ent_coef * entropy_loss + v_loss * args.vf_coef
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=args.max_grad_norm)
+                optimizer.step()
+
+                with torch.no_grad():
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    clipfracs.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
+                    old_approx_kl_values.append(old_approx_kl.item())
+                    approx_kl_values.append(approx_kl.item())
+                    pg_loss_values.append(pg_loss.item())
+                    v_loss_values.append(v_loss.item())
+                    entropy_values.append(entropy_loss.item())
+                    total_loss_values.append(loss.item())
+
+                if args.target_kl is not None and approx_kl.item() > args.target_kl:
+                    early_stop = True
+                    break
+
+            if early_stop:
+                break
+
+        if early_stop:
+            break
+
+    return {
+        "pg_loss": float(np.mean(pg_loss_values)) if pg_loss_values else 0.0,
+        "v_loss": float(np.mean(v_loss_values)) if v_loss_values else 0.0,
+        "entropy": float(np.mean(entropy_values)) if entropy_values else 0.0,
+        "loss": float(np.mean(total_loss_values)) if total_loss_values else 0.0,
+        "old_approx_kl": float(np.mean(old_approx_kl_values)) if old_approx_kl_values else 0.0,
+        "approx_kl": float(np.mean(approx_kl_values)) if approx_kl_values else 0.0,
+        "clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0,
+    }
+
+
+def log_iteration(
+    writer, episode_infos, sampled_episode_infos, metrics,
+    values, advantages, returns, lr, ent_coef, global_step, start_time, iteration,
+):
+    """Aggregate episode stats, print summary line, and write to TensorBoard."""
+    episode_infos.extend(sampled_episode_infos)
+    episode_result = {}
+    if len(episode_infos) > 0:
+        for key in episode_infos[0].keys():
+            episode_result[key + "_mean"] = np.mean([info[key] for info in episode_infos])
+    episode_return_mean = episode_result.get("r_mean", float("nan"))
+    episode_length_mean = episode_result.get("l_mean", float("nan"))
+    value_mean = float(values.mean().item())
+    advantage_mean = float(advantages.mean().item())
+
+    print(
+        "{:9} SPS={:4} return={:.2f} length={:.1f} pi_loss={:.3f} v_loss={:.3f} entropy={:.3f} value={:.3f} adv={:.3f}".format(
+            iteration,
+            int(global_step / (time.time() - start_time)),
+            episode_return_mean,
+            episode_length_mean,
+            metrics["pg_loss"],
+            metrics["v_loss"],
+            metrics["entropy"],
+            value_mean,
+            advantage_mean,
+        )
+    )
+
+    if episode_result:
+        for key in episode_result:
+            writer.add_scalar("episode/" + key, episode_result[key], global_step)
+    writer.add_scalar("episode/value_mean", value_mean, global_step)
+    writer.add_scalar("episode/advantage_mean", advantage_mean, global_step)
+    writer.add_scalar("charts/learning_rate", lr, global_step)
+    writer.add_scalar("charts/entropy_coefficient", ent_coef, global_step)
+    writer.add_scalar("losses/policy_loss", metrics["pg_loss"], global_step)
+    writer.add_scalar("losses/value_loss", metrics["v_loss"], global_step)
+    writer.add_scalar("losses/loss", metrics["loss"], global_step)
+    writer.add_scalar("losses/entropy", metrics["entropy"], global_step)
+    writer.add_scalar("losses/old_approx_kl", metrics["old_approx_kl"], global_step)
+    writer.add_scalar("losses/approx_kl", metrics["approx_kl"], global_step)
+    writer.add_scalar("losses/clipfrac", metrics["clipfrac"], global_step)
+
+    y_pred, y_true = values.reshape(-1).cpu().numpy(), returns.reshape(-1).cpu().numpy()
+    var_y = np.var(y_true)
+    explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+    writer.add_scalar("losses/explained_variance", explained_var, global_step)
+    writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -562,14 +780,6 @@ if __name__ == "__main__":
         raise ValueError(f"`num_envs` ({args.num_envs}) must be divisible by `num_minibatches` ({args.num_minibatches})")
     if args.trxl_memory_length <= 0:
         raise ValueError(f"`trxl_memory_length` must be > 0, got {args.trxl_memory_length}")
-    if args.parallel_equivalence_check_batches < 0:
-        raise ValueError(
-            f"`parallel_equivalence_check_batches` must be >= 0, got {args.parallel_equivalence_check_batches}"
-        )
-    if args.parallel_equivalence_atol < 0:
-        raise ValueError(f"`parallel_equivalence_atol` must be >= 0, got {args.parallel_equivalence_atol}")
-    if args.parallel_equivalence_rtol < 0:
-        raise ValueError(f"`parallel_equivalence_rtol` must be >= 0, got {args.parallel_equivalence_rtol}")
 
     args.batch_size = int(args.num_envs * args.num_steps)
     args.num_segments = int(args.num_steps // args.segment_length)
@@ -596,13 +806,12 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # TRY NOT TO MODIFY: seeding
+    # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    # Determine the device to be used for training and set the default tensor type
     if args.cuda:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         torch.set_default_device(device)
@@ -615,13 +824,12 @@ if __name__ == "__main__":
     )
     observation_space = envs.single_observation_space
     action_dim = envs.single_action_space.n
-    # Determine maximum episode steps
     envs.envs[0].reset()  # Memory Gym envs expose max_episode_steps after reset
     max_episode_steps = envs.envs[0].get_wrapper_attr("max_episode_steps")
     if max_episode_steps <= 0:
-        max_episode_steps = 1024  # Memory Gym envs have max_episode_steps set to -1
-    # Set transformer memory length to max episode steps if greater than max episode steps
+        max_episode_steps = 1024
     args.trxl_memory_length = min(args.trxl_memory_length, max_episode_steps)
+
     agent = Agent(args, observation_space, action_dim, max_episode_steps).to(device)
     get_action_and_value = agent.get_action_and_value
     evaluate_segment = agent.evaluate_segment
@@ -630,7 +838,7 @@ if __name__ == "__main__":
         evaluate_segment = torch.compile(evaluate_segment, mode=args.torch_compile_mode, fullgraph=False)
     optimizer = optim.AdamW(agent.parameters(), lr=args.init_lr)
 
-    # ALGO Logic: Storage setup
+    # Storage
     rewards = torch.zeros((args.num_steps, args.num_envs), dtype=torch.float32, device=device)
     actions = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long, device=device)
     dones = torch.zeros((args.num_steps, args.num_envs), dtype=torch.float32, device=device)
@@ -638,106 +846,43 @@ if __name__ == "__main__":
     log_probs = torch.zeros((args.num_steps, args.num_envs), dtype=torch.float32, device=device)
     values = torch.zeros((args.num_steps, args.num_envs), dtype=torch.float32, device=device)
     segment_init_memory = torch.zeros(
-        (
-            args.num_segments,
-            args.num_envs,
-            args.trxl_memory_length,
-            args.trxl_num_layers,
-            args.trxl_dim,
-        ),
+        (args.num_segments, args.num_envs, args.trxl_memory_length, args.trxl_num_layers, args.trxl_dim),
         dtype=torch.float32,
         device="cpu",
     )
     segment_init_valid_len = torch.zeros((args.num_segments, args.num_envs), dtype=torch.long, device="cpu")
     segment_init_pos = torch.zeros((args.num_segments, args.num_envs), dtype=torch.long, device="cpu")
 
-    # TRY NOT TO MODIFY: start the game
+    # Training loop
     global_step = 0
     start_time = time.time()
-    episode_infos = deque(maxlen=100)  # Store episode results for monitoring statistics
+    episode_infos = deque(maxlen=100)
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
     next_done = torch.zeros(args.num_envs, dtype=torch.float32, device=device)
-    rollout_state = init_trxl_state(
-        args.num_envs,
-        args.trxl_memory_length,
-        args.trxl_num_layers,
-        args.trxl_dim,
-        device,
+    rollout_state = TrXLState.zeros(
+        args.num_envs, args.trxl_memory_length, args.trxl_num_layers, args.trxl_dim, device,
     )
 
     for iteration in range(1, args.num_iterations + 1):
-        sampled_episode_infos = []
-
-        # Annealing the learning rate and entropy coefficient if instructed to do so
-        do_anneal = args.anneal_steps > 0 and global_step < args.anneal_steps
-        frac = 1 - global_step / args.anneal_steps if do_anneal else 0
-        lr = (args.init_lr - args.final_lr) * frac + args.final_lr
+        lr, ent_coef = anneal_schedule(args, global_step)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        ent_coef = (args.init_ent_coef - args.final_ent_coef) * frac + args.final_ent_coef
 
-        for step in range(args.num_steps):
-            global_step += args.num_envs
+        next_obs, next_done, rollout_state, steps, sampled_episode_infos = collect_rollout(
+            envs, get_action_and_value, rollout_state, args,
+            obs, dones, actions, log_probs, values, rewards,
+            segment_init_memory, segment_init_valid_len, segment_init_pos,
+            next_obs, next_done, max_episode_steps, device,
+        )
+        global_step += steps
 
-            # ALGO LOGIC: action logic
-            with torch.no_grad():
-                rollout_state = reset_done_in_state(rollout_state, next_done.bool())
-                if step % args.segment_length == 0:
-                    segment_id = step // args.segment_length
-                    segment_init_memory[segment_id] = rollout_state.memory.detach().cpu()
-                    segment_init_valid_len[segment_id] = rollout_state.valid_len.detach().cpu()
-                    segment_init_pos[segment_id] = rollout_state.pos.detach().cpu()
+        advantages, returns = compute_gae(
+            agent, next_obs, next_done, rollout_state, rewards, dones, values,
+            args, max_episode_steps, device,
+        )
 
-                obs[step] = next_obs
-                dones[step] = next_done
-                memory_window, memory_mask = build_memory_inputs(rollout_state, args.trxl_memory_length)
-                action, logprob, _, value, new_memory = get_action_and_value(
-                    next_obs,
-                    memory_window,
-                    memory_mask,
-                    detach_new_memory=True,
-                )
-                rollout_state = append_memory_token(rollout_state, new_memory, max_episode_steps)
-                # Store the action, log_prob, and value in the buffer
-                actions[step], log_probs[step], values[step] = action, logprob, value
-
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
-            next_done = np.maximum(terminations, truncations).astype(np.float32)
-            rewards[step] = torch.tensor(reward, dtype=torch.float32, device=device).view(-1)
-            next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
-            next_done = torch.tensor(next_done, dtype=torch.float32, device=device)
-
-            if "_episode" in infos and "episode" in infos:
-                finished = np.asarray(infos["_episode"], dtype=bool)
-                for i in np.where(finished)[0]:
-                    sampled_episode_infos.append({k: infos["episode"][k][i] for k in infos["episode"]})
-
-        # Bootstrap value if not done
-        with torch.no_grad():
-            bootstrap_state = clone_trxl_state(rollout_state, device=device)
-            bootstrap_state = reset_done_in_state(bootstrap_state, next_done.bool())
-            memory_window, memory_mask = build_memory_inputs(bootstrap_state, args.trxl_memory_length)
-            next_value = agent.get_value(
-                next_obs,
-                memory_window,
-                memory_mask,
-            )
-            advantages = torch.zeros_like(rewards, device=device)
-            lastgaelam = torch.zeros((args.num_envs,), dtype=torch.float32, device=device)
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                advantages[t] = lastgaelam
-            returns = advantages + values
-
+        # Reshape rollout data into segments
         segment_obs = obs.reshape(args.num_segments, args.segment_length, args.num_envs, *obs.shape[2:])
         segment_dones = dones.reshape(args.num_segments, args.segment_length, args.num_envs)
         segment_actions = actions.reshape(args.num_segments, args.segment_length, args.num_envs)
@@ -746,176 +891,18 @@ if __name__ == "__main__":
         segment_returns = returns.reshape(args.num_segments, args.segment_length, args.num_envs)
         segment_old_values = values.reshape(args.num_segments, args.segment_length, args.num_envs)
 
-        # Optimizing the policy and value network
-        clipfracs = []
-        old_approx_kl_values = []
-        approx_kl_values = []
-        pg_loss_values = []
-        v_loss_values = []
-        entropy_values = []
-        total_loss_values = []
-        early_stop = False
-        equivalence_checks_done = 0
-        for epoch in range(args.update_epochs):
-            env_perm = torch.randperm(args.num_envs, device="cpu")
-            for mb_start in range(0, args.num_envs, args.envs_per_minibatch):
-                mb_end = mb_start + args.envs_per_minibatch
-                env_ids_cpu = env_perm[mb_start:mb_end]
-                env_ids = env_ids_cpu.to(device)
-
-                for seg_id in range(args.num_segments):
-                    mb_obs = segment_obs[seg_id, :, env_ids]
-                    mb_dones = segment_dones[seg_id, :, env_ids]
-                    mb_actions = segment_actions[seg_id, :, env_ids]
-                    mb_old_log_probs = segment_old_log_probs[seg_id, :, env_ids]
-                    mb_advantages = segment_advantages[seg_id, :, env_ids]
-                    mb_returns = segment_returns[seg_id, :, env_ids]
-                    mb_old_values = segment_old_values[seg_id, :, env_ids]
-                    mb_init_state = TrXLState(
-                        memory=segment_init_memory[seg_id, env_ids_cpu].to(device),
-                        valid_len=segment_init_valid_len[seg_id, env_ids_cpu].to(device),
-                        pos=segment_init_pos[seg_id, env_ids_cpu].to(device),
-                    )
-
-                    newlogprob, entropy, newvalue = evaluate_segment(
-                        mb_obs, mb_actions, mb_dones, mb_init_state, max_episode_steps
-                    )
-                    if (
-                        args.parallel_equivalence_check_batches > 0
-                        and equivalence_checks_done < args.parallel_equivalence_check_batches
-                    ):
-                        with torch.no_grad():
-                            ref_newlogprob, ref_entropy, ref_newvalue = agent.evaluate_segment_sequential(
-                                mb_obs, mb_actions, mb_dones, mb_init_state, max_episode_steps
-                            )
-                        assert_tensor_allclose(
-                            "newlogprob",
-                            newlogprob,
-                            ref_newlogprob,
-                            args.parallel_equivalence_atol,
-                            args.parallel_equivalence_rtol,
-                        )
-                        assert_tensor_allclose(
-                            "entropy",
-                            entropy,
-                            ref_entropy,
-                            args.parallel_equivalence_atol,
-                            args.parallel_equivalence_rtol,
-                        )
-                        assert_tensor_allclose(
-                            "newvalue",
-                            newvalue,
-                            ref_newvalue,
-                            args.parallel_equivalence_atol,
-                            args.parallel_equivalence_rtol,
-                        )
-                        equivalence_checks_done += 1
-
-                    flat_advantages = mb_advantages.reshape(-1)
-                    if args.norm_adv:
-                        flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
-                    flat_newlogprob = newlogprob.reshape(-1)
-                    flat_old_log_probs = mb_old_log_probs.reshape(-1)
-                    logratio = flat_newlogprob - flat_old_log_probs
-                    ratio = torch.exp(logratio)
-                    pgloss1 = -flat_advantages * ratio
-                    pgloss2 = -flat_advantages * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
-                    pg_loss = torch.max(pgloss1, pgloss2).mean()
-
-                    flat_newvalue = newvalue.reshape(-1)
-                    flat_returns = mb_returns.reshape(-1)
-                    flat_old_values = mb_old_values.reshape(-1)
-                    v_loss_unclipped = (flat_newvalue - flat_returns) ** 2
-                    if args.clip_vloss:
-                        v_loss_clipped = flat_old_values + (flat_newvalue - flat_old_values).clamp(
-                            min=-args.clip_coef, max=args.clip_coef
-                        )
-                        v_loss = torch.max(v_loss_unclipped, (v_loss_clipped - flat_returns) ** 2).mean()
-                    else:
-                        v_loss = v_loss_unclipped.mean()
-
-                    entropy_loss = entropy.reshape(-1).mean()
-                    loss = pg_loss - ent_coef * entropy_loss + v_loss * args.vf_coef
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=args.max_grad_norm)
-                    optimizer.step()
-
-                    with torch.no_grad():
-                        old_approx_kl = (-logratio).mean()
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clipfracs.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
-                        old_approx_kl_values.append(old_approx_kl.item())
-                        approx_kl_values.append(approx_kl.item())
-                        pg_loss_values.append(pg_loss.item())
-                        v_loss_values.append(v_loss.item())
-                        entropy_values.append(entropy_loss.item())
-                        total_loss_values.append(loss.item())
-
-                    if args.target_kl is not None and approx_kl.item() > args.target_kl:
-                        early_stop = True
-                        break
-
-                if early_stop:
-                    break
-
-            if early_stop:
-                break
-
-        pg_loss_mean = float(np.mean(pg_loss_values)) if pg_loss_values else 0.0
-        v_loss_mean = float(np.mean(v_loss_values)) if v_loss_values else 0.0
-        entropy_loss_mean = float(np.mean(entropy_values)) if entropy_values else 0.0
-        loss_mean = float(np.mean(total_loss_values)) if total_loss_values else 0.0
-        old_approx_kl_mean = float(np.mean(old_approx_kl_values)) if old_approx_kl_values else 0.0
-        approx_kl_mean = float(np.mean(approx_kl_values)) if approx_kl_values else 0.0
-        clipfrac_mean = float(np.mean(clipfracs)) if clipfracs else 0.0
-
-        y_pred, y_true = values.reshape(-1).cpu().numpy(), returns.reshape(-1).cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        # Log and monitor training statistics
-        episode_infos.extend(sampled_episode_infos)
-        episode_result = {}
-        if len(episode_infos) > 0:
-            for key in episode_infos[0].keys():
-                episode_result[key + "_mean"] = np.mean([info[key] for info in episode_infos])
-        episode_return_mean = episode_result.get("r_mean", float("nan"))
-        episode_length_mean = episode_result.get("l_mean", float("nan"))
-        value_mean = float(values.mean().item())
-        advantage_mean = float(advantages.mean().item())
-
-        print(
-            "{:9} SPS={:4} return={:.2f} length={:.1f} pi_loss={:.3f} v_loss={:.3f} entropy={:.3f} value={:.3f} adv={:.3f}".format(
-                iteration,
-                int(global_step / (time.time() - start_time)),
-                episode_return_mean,
-                episode_length_mean,
-                pg_loss_mean,
-                v_loss_mean,
-                entropy_loss_mean,
-                value_mean,
-                advantage_mean,
-            )
+        metrics = ppo_update(
+            agent, evaluate_segment, optimizer, args, ent_coef,
+            segment_obs, segment_dones, segment_actions, segment_old_log_probs,
+            segment_advantages, segment_returns, segment_old_values,
+            segment_init_memory, segment_init_valid_len, segment_init_pos,
+            max_episode_steps, device,
         )
 
-        if episode_result:
-            for key in episode_result:
-                writer.add_scalar("episode/" + key, episode_result[key], global_step)
-        writer.add_scalar("episode/value_mean", value_mean, global_step)
-        writer.add_scalar("episode/advantage_mean", advantage_mean, global_step)
-        writer.add_scalar("charts/learning_rate", lr, global_step)
-        writer.add_scalar("charts/entropy_coefficient", ent_coef, global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss_mean, global_step)
-        writer.add_scalar("losses/value_loss", v_loss_mean, global_step)
-        writer.add_scalar("losses/loss", loss_mean, global_step)
-        writer.add_scalar("losses/entropy", entropy_loss_mean, global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl_mean, global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl_mean, global_step)
-        writer.add_scalar("losses/clipfrac", clipfrac_mean, global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        log_iteration(
+            writer, episode_infos, sampled_episode_infos, metrics,
+            values, advantages, returns, lr, ent_coef, global_step, start_time, iteration,
+        )
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
