@@ -40,6 +40,10 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = False
     """whether to save model into the `runs/{run_name}` folder"""
+    torch_compile: bool = False
+    """if toggled, compile hot paths with torch.compile"""
+    torch_compile_mode: str = "reduce-overhead"
+    """torch.compile mode (`default`, `reduce-overhead`, `max-autotune`)"""
 
     # Algorithm specific arguments
     env_id: str = "MortarMayhem-Grid-v0"
@@ -254,7 +258,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("inv_freqs", inv_freqs)
 
     def forward(self, seq_len):
-        seq = torch.arange(seq_len - 1, -1, -1.0)
+        seq = torch.arange(seq_len - 1, -1, -1.0, device=self.inv_freqs.device, dtype=self.inv_freqs.dtype)
         sinusoidal_inp = rearrange(seq, "n -> n ()") * rearrange(self.inv_freqs, "d -> () d")
         pos_emb = torch.cat((sinusoidal_inp.sin(), sinusoidal_inp.cos()), dim=-1)
         return pos_emb
@@ -375,12 +379,12 @@ class Transformer(nn.Module):
             layer_mask = mask
             if layer_mask is not None:
                 no_key_rows = ~layer_mask.any(dim=2, keepdim=True)
-                if no_key_rows.any():
-                    dummy_kv = fallback_kv_token.to(dtype=kv.dtype, device=kv.device).view(1, 1, -1).expand(
-                        kv.shape[0], 1, kv.shape[2]
-                    )
-                    kv = torch.cat((dummy_kv, kv), dim=1)
-                    layer_mask = torch.cat((no_key_rows, layer_mask), dim=2)
+                # Always prepend a fallback key to avoid data-dependent graph breaks in torch.compile.
+                dummy_kv = fallback_kv_token.to(dtype=kv.dtype, device=kv.device).view(1, 1, -1).expand(
+                    kv.shape[0], 1, kv.shape[2]
+                )
+                kv = torch.cat((dummy_kv, kv), dim=1)
+                layer_mask = torch.cat((no_key_rows, layer_mask), dim=2)
             x, attention_weights = layer(kv, kv, x, layer_mask)  # args: value, key, query, mask
             del attention_weights
         return x, torch.stack(layer_inputs, dim=2)
@@ -547,6 +551,11 @@ if __name__ == "__main__":
     # Set transformer memory length to max episode steps if greater than max episode steps
     args.trxl_memory_length = min(args.trxl_memory_length, max_episode_steps)
     agent = Agent(args, observation_space, action_dim, max_episode_steps).to(device)
+    get_action_and_value = agent.get_action_and_value
+    evaluate_segment = agent.evaluate_segment
+    if args.torch_compile:
+        get_action_and_value = torch.compile(get_action_and_value, mode=args.torch_compile_mode, fullgraph=False)
+        evaluate_segment = torch.compile(evaluate_segment, mode=args.torch_compile_mode, fullgraph=False)
     optimizer = optim.AdamW(agent.parameters(), lr=args.init_lr)
 
     # ALGO Logic: Storage setup
@@ -613,7 +622,7 @@ if __name__ == "__main__":
                 memory_window, memory_mask, memory_indices = build_memory_inputs(
                     rollout_state, args.trxl_memory_length, max_episode_steps
                 )
-                action, logprob, _, value, new_memory = agent.get_action_and_value(
+                action, logprob, _, value, new_memory = get_action_and_value(
                     next_obs,
                     memory_window,
                     memory_mask,
@@ -701,7 +710,7 @@ if __name__ == "__main__":
                         pos=segment_init_pos[seg_id, env_ids_cpu].to(device),
                     )
 
-                    newlogprob, entropy, newvalue = agent.evaluate_segment(
+                    newlogprob, entropy, newvalue = evaluate_segment(
                         mb_obs, mb_actions, mb_dones, mb_init_state, max_episode_steps
                     )
 
