@@ -92,10 +92,6 @@ class Args:
     """the dimension of the transformer"""
     trxl_memory_length: int = 88
     """the length of TrXL's sliding memory window"""
-    trxl_positional_encoding: str = "absolute"
-    """the positional encoding type of the transformer, choices: "", "absolute", "learned" """
-    reconstruction_coef: float = 0.0
-    """the coefficient of the observation reconstruction loss, if set to 0.0 the reconstruction loss is not used"""
 
     # To be filled on runtime
     batch_size: int = 0
@@ -339,23 +335,16 @@ class TransformerLayer(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, num_layers, dim, num_heads, max_episode_steps, positional_encoding):
+    def __init__(self, num_layers, dim, num_heads, max_episode_steps):
         super().__init__()
         self.max_episode_steps = max_episode_steps
-        self.positional_encoding = positional_encoding
-        if positional_encoding == "absolute":
-            self.pos_embedding = PositionalEncoding(dim)
-        elif positional_encoding == "learned":
-            self.pos_embedding = nn.Parameter(torch.randn(max_episode_steps, dim))
+        self.pos_embedding = PositionalEncoding(dim)
         self.transformer_layers = nn.ModuleList([TransformerLayer(dim, num_heads) for _ in range(num_layers)])
 
     def forward(self, x, memories, mask, memory_indices, detach_new_memory=True):
-        # Add positional encoding to every transformer layer input
-        if self.positional_encoding == "absolute":
-            pos_embedding = self.pos_embedding(self.max_episode_steps)[memory_indices]
-            memories = memories + pos_embedding.unsqueeze(2)
-        elif self.positional_encoding == "learned":
-            memories = memories + self.pos_embedding[memory_indices].unsqueeze(2)
+        # Add absolute positional encoding to every transformer layer input
+        pos_embedding = self.pos_embedding(self.max_episode_steps)[memory_indices]
+        memories = memories + pos_embedding.unsqueeze(2)
 
         # Forward transformer layers and return new memories (i.e. hidden states)
         out_memories = []
@@ -373,19 +362,10 @@ class Transformer(nn.Module):
         if x_seq.ndim != 3:
             raise ValueError(f"`x_seq` must be rank-3 [B, T, D], got shape={tuple(x_seq.shape)}")
 
-        if self.positional_encoding == "absolute":
-            pos_embedding = self.pos_embedding(self.max_episode_steps)
-            memory_pos_embedding = pos_embedding[memory_indices]
-            query_pos_embedding = pos_embedding[query_indices]
-            fallback_kv_token = pos_embedding[0]
-        elif self.positional_encoding == "learned":
-            memory_pos_embedding = self.pos_embedding[memory_indices]
-            query_pos_embedding = self.pos_embedding[query_indices]
-            fallback_kv_token = self.pos_embedding[0]
-        else:
-            memory_pos_embedding = torch.zeros_like(memories[:, :, 0])
-            query_pos_embedding = torch.zeros_like(x_seq)
-            fallback_kv_token = torch.zeros((x_seq.shape[-1],), dtype=x_seq.dtype, device=x_seq.device)
+        pos_embedding = self.pos_embedding(self.max_episode_steps)
+        memory_pos_embedding = pos_embedding[memory_indices]
+        query_pos_embedding = pos_embedding[query_indices]
+        fallback_kv_token = pos_embedding[0]
 
         x = x_seq
         layer_inputs = []
@@ -407,7 +387,7 @@ class Transformer(nn.Module):
 
 
 class Agent(nn.Module):
-    def __init__(self, args, observation_space, action_space_shape, max_episode_steps):
+    def __init__(self, args, observation_space, action_dim, max_episode_steps):
         super().__init__()
         self.obs_shape = observation_space.shape
         self.max_episode_steps = max_episode_steps
@@ -427,35 +407,15 @@ class Agent(nn.Module):
         else:
             self.encoder = layer_init(nn.Linear(observation_space.shape[0], args.trxl_dim))
 
-        self.transformer = Transformer(
-            args.trxl_num_layers, args.trxl_dim, args.trxl_num_heads, self.max_episode_steps, args.trxl_positional_encoding
-        )
+        self.transformer = Transformer(args.trxl_num_layers, args.trxl_dim, args.trxl_num_heads, self.max_episode_steps)
 
         self.hidden_post_trxl = nn.Sequential(
             layer_init(nn.Linear(args.trxl_dim, args.trxl_dim)),
             nn.ReLU(),
         )
 
-        self.actor_branches = nn.ModuleList(
-            [
-                layer_init(nn.Linear(args.trxl_dim, out_features=num_actions), np.sqrt(0.01))
-                for num_actions in action_space_shape
-            ]
-        )
+        self.actor = layer_init(nn.Linear(args.trxl_dim, out_features=action_dim), np.sqrt(0.01))
         self.critic = layer_init(nn.Linear(args.trxl_dim, 1), 1)
-
-        if args.reconstruction_coef > 0.0:
-            self.transposed_cnn = nn.Sequential(
-                layer_init(nn.Linear(args.trxl_dim, 64 * 7 * 7)),
-                nn.ReLU(),
-                nn.Unflatten(1, (64, 7, 7)),
-                layer_init(nn.ConvTranspose2d(64, 64, 3, stride=1)),
-                nn.ReLU(),
-                layer_init(nn.ConvTranspose2d(64, 32, 4, stride=2)),
-                nn.ReLU(),
-                layer_init(nn.ConvTranspose2d(32, 3, 8, stride=4)),
-                nn.Sigmoid(),
-            )
 
     def get_value(self, x, memory, memory_mask, memory_indices, detach_new_memory=True):
         if len(self.obs_shape) > 1:
@@ -479,15 +439,12 @@ class Agent(nn.Module):
             detach_new_memory=detach_new_memory,
         )
         x = self.hidden_post_trxl(x)
-        self.x = x
-        probs = [Categorical(logits=branch(x)) for branch in self.actor_branches]
+        probs = Categorical(logits=self.actor(x))
         if action is None:
-            action = torch.stack([dist.sample() for dist in probs], dim=1)
-        log_probs = []
-        for i, dist in enumerate(probs):
-            log_probs.append(dist.log_prob(action[:, i]))
-        entropies = torch.stack([dist.entropy() for dist in probs], dim=1).sum(1).reshape(-1)
-        return action, torch.stack(log_probs, dim=1), entropies, self.critic(x).flatten(), memory
+            action = probs.sample()
+        log_probs = probs.log_prob(action)
+        entropies = probs.entropy()
+        return action, log_probs, entropies, self.critic(x).flatten(), memory
 
     def evaluate_segment(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
         seq_len, batch_size = obs_seq.shape[0], obs_seq.shape[1]
@@ -516,27 +473,15 @@ class Agent(nn.Module):
 
         x_seq = self.hidden_post_trxl(x_seq)
         x_flat = x_seq.permute((1, 0, 2)).reshape(seq_len * batch_size, -1)
-        self.x = x_flat
 
-        probs = [Categorical(logits=branch(x_flat)) for branch in self.actor_branches]
-        flat_actions = actions_seq.reshape(seq_len * batch_size, -1)
-        log_probs = []
-        for i, dist in enumerate(probs):
-            log_probs.append(dist.log_prob(flat_actions[:, i]))
-        entropies = torch.stack([dist.entropy() for dist in probs], dim=1).sum(1).reshape(seq_len, batch_size)
+        probs = Categorical(logits=self.actor(x_flat))
+        flat_actions = actions_seq.reshape(seq_len * batch_size)
+        log_probs = probs.log_prob(flat_actions)
+        entropies = probs.entropy().reshape(seq_len, batch_size)
         values = self.critic(x_flat).flatten().reshape(seq_len, batch_size)
-        new_log_probs = torch.stack(log_probs, dim=1).reshape(seq_len, batch_size, len(self.actor_branches))
+        new_log_probs = log_probs.reshape(seq_len, batch_size)
 
-        reconstruction_seq = None
-        if hasattr(self, "transposed_cnn"):
-            recon_flat = self.reconstruct_observation()
-            reconstruction_seq = recon_flat.reshape(seq_len, batch_size, *recon_flat.shape[1:])
-
-        return new_log_probs, entropies, values, reconstruction_seq
-
-    def reconstruct_observation(self):
-        x = self.transposed_cnn(self.x)
-        return x.permute((0, 2, 3, 1))
+        return new_log_probs, entropies, values
 
 
 if __name__ == "__main__":
@@ -593,11 +538,7 @@ if __name__ == "__main__":
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
     observation_space = envs.single_observation_space
-    action_space_shape = (
-        (envs.single_action_space.n,)
-        if isinstance(envs.single_action_space, gym.spaces.Discrete)
-        else tuple(envs.single_action_space.nvec)
-    )
+    action_dim = envs.single_action_space.n
     # Determine maximum episode steps
     envs.envs[0].reset()  # Memory Gym envs expose max_episode_steps after reset
     max_episode_steps = envs.envs[0].get_wrapper_attr("max_episode_steps")
@@ -605,19 +546,15 @@ if __name__ == "__main__":
         max_episode_steps = 1024  # Memory Gym envs have max_episode_steps set to -1
     # Set transformer memory length to max episode steps if greater than max episode steps
     args.trxl_memory_length = min(args.trxl_memory_length, max_episode_steps)
-    if args.reconstruction_coef > 0.0 and len(observation_space.shape) <= 1:
-        raise ValueError("`reconstruction_coef > 0.0` requires image observations.")
-
-    agent = Agent(args, observation_space, action_space_shape, max_episode_steps).to(device)
+    agent = Agent(args, observation_space, action_dim, max_episode_steps).to(device)
     optimizer = optim.AdamW(agent.parameters(), lr=args.init_lr)
-    bce_loss = nn.BCELoss()  # Binary cross entropy loss for observation reconstruction
 
     # ALGO Logic: Storage setup
     rewards = torch.zeros((args.num_steps, args.num_envs), dtype=torch.float32, device=device)
-    actions = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.long, device=device)
+    actions = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long, device=device)
     dones = torch.zeros((args.num_steps, args.num_envs), dtype=torch.float32, device=device)
     obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape, dtype=torch.float32, device=device)
-    log_probs = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.float32, device=device)
+    log_probs = torch.zeros((args.num_steps, args.num_envs), dtype=torch.float32, device=device)
     values = torch.zeros((args.num_steps, args.num_envs), dtype=torch.float32, device=device)
     segment_init_memory = torch.zeros(
         (
@@ -728,8 +665,8 @@ if __name__ == "__main__":
 
         segment_obs = obs.reshape(args.num_segments, args.segment_length, args.num_envs, *obs.shape[2:])
         segment_dones = dones.reshape(args.num_segments, args.segment_length, args.num_envs)
-        segment_actions = actions.reshape(args.num_segments, args.segment_length, args.num_envs, *actions.shape[2:])
-        segment_old_log_probs = log_probs.reshape(args.num_segments, args.segment_length, args.num_envs, *log_probs.shape[2:])
+        segment_actions = actions.reshape(args.num_segments, args.segment_length, args.num_envs)
+        segment_old_log_probs = log_probs.reshape(args.num_segments, args.segment_length, args.num_envs)
         segment_advantages = advantages.reshape(args.num_segments, args.segment_length, args.num_envs)
         segment_returns = returns.reshape(args.num_segments, args.segment_length, args.num_envs)
         segment_old_values = values.reshape(args.num_segments, args.segment_length, args.num_envs)
@@ -741,7 +678,6 @@ if __name__ == "__main__":
         pg_loss_values = []
         v_loss_values = []
         entropy_values = []
-        r_loss_values = []
         total_loss_values = []
         early_stop = False
         for epoch in range(args.update_epochs):
@@ -765,18 +701,15 @@ if __name__ == "__main__":
                         pos=segment_init_pos[seg_id, env_ids_cpu].to(device),
                     )
 
-                    newlogprob, entropy, newvalue, recon_seq = agent.evaluate_segment(
+                    newlogprob, entropy, newvalue = agent.evaluate_segment(
                         mb_obs, mb_actions, mb_dones, mb_init_state, max_episode_steps
                     )
 
                     flat_advantages = mb_advantages.reshape(-1)
                     if args.norm_adv:
                         flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
-                    flat_advantages = flat_advantages.unsqueeze(1).repeat(
-                        1, len(action_space_shape)
-                    )  # Repeat is necessary for multi-discrete action spaces
-                    flat_newlogprob = newlogprob.reshape(-1, newlogprob.shape[-1])
-                    flat_old_log_probs = mb_old_log_probs.reshape(-1, mb_old_log_probs.shape[-1])
+                    flat_newlogprob = newlogprob.reshape(-1)
+                    flat_old_log_probs = mb_old_log_probs.reshape(-1)
                     logratio = flat_newlogprob - flat_old_log_probs
                     ratio = torch.exp(logratio)
                     pgloss1 = -flat_advantages * ratio
@@ -798,17 +731,6 @@ if __name__ == "__main__":
                     entropy_loss = entropy.reshape(-1).mean()
                     loss = pg_loss - ent_coef * entropy_loss + v_loss * args.vf_coef
 
-                    r_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
-                    if args.reconstruction_coef > 0.0:
-                        if recon_seq is None:
-                            raise ValueError("Reconstruction loss requires image observations.")
-                        target_obs = mb_obs / 255.0
-                        r_loss = bce_loss(
-                            recon_seq.reshape(-1, *recon_seq.shape[3:]),
-                            target_obs.reshape(-1, *target_obs.shape[3:]),
-                        )
-                        loss += args.reconstruction_coef * r_loss
-
                     optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=args.max_grad_norm)
@@ -823,7 +745,6 @@ if __name__ == "__main__":
                         pg_loss_values.append(pg_loss.item())
                         v_loss_values.append(v_loss.item())
                         entropy_values.append(entropy_loss.item())
-                        r_loss_values.append(r_loss.item())
                         total_loss_values.append(loss.item())
 
                     if args.target_kl is not None and approx_kl.item() > args.target_kl:
@@ -839,7 +760,6 @@ if __name__ == "__main__":
         pg_loss_mean = float(np.mean(pg_loss_values)) if pg_loss_values else 0.0
         v_loss_mean = float(np.mean(v_loss_values)) if v_loss_values else 0.0
         entropy_loss_mean = float(np.mean(entropy_values)) if entropy_values else 0.0
-        r_loss_mean = float(np.mean(r_loss_values)) if r_loss_values else 0.0
         loss_mean = float(np.mean(total_loss_values)) if total_loss_values else 0.0
         old_approx_kl_mean = float(np.mean(old_approx_kl_values)) if old_approx_kl_values else 0.0
         approx_kl_mean = float(np.mean(approx_kl_values)) if approx_kl_values else 0.0
@@ -861,7 +781,7 @@ if __name__ == "__main__":
         advantage_mean = float(advantages.mean().item())
 
         print(
-            "{:9} SPS={:4} return={:.2f} length={:.1f} pi_loss={:.3f} v_loss={:.3f} entropy={:.3f} r_loss={:.3f} value={:.3f} adv={:.3f}".format(
+            "{:9} SPS={:4} return={:.2f} length={:.1f} pi_loss={:.3f} v_loss={:.3f} entropy={:.3f} value={:.3f} adv={:.3f}".format(
                 iteration,
                 int(global_step / (time.time() - start_time)),
                 episode_return_mean,
@@ -869,7 +789,6 @@ if __name__ == "__main__":
                 pg_loss_mean,
                 v_loss_mean,
                 entropy_loss_mean,
-                r_loss_mean,
                 value_mean,
                 advantage_mean,
             )
@@ -886,7 +805,6 @@ if __name__ == "__main__":
         writer.add_scalar("losses/value_loss", v_loss_mean, global_step)
         writer.add_scalar("losses/loss", loss_mean, global_step)
         writer.add_scalar("losses/entropy", entropy_loss_mean, global_step)
-        writer.add_scalar("losses/reconstruction_loss", r_loss_mean, global_step)
         writer.add_scalar("losses/old_approx_kl", old_approx_kl_mean, global_step)
         writer.add_scalar("losses/approx_kl", approx_kl_mean, global_step)
         writer.add_scalar("losses/clipfrac", clipfrac_mean, global_step)
