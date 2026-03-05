@@ -12,7 +12,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import rlax
 import wandb
 
 
@@ -68,14 +67,6 @@ class TrXLState(struct.PyTreeNode):
     memory: jax.Array       # [B, M, L, D]
     valid_len: jax.Array    # [B]
     pos: jax.Array          # [B]
-
-
-def detach_state(state: TrXLState) -> TrXLState:
-    return TrXLState(
-        memory=jax.lax.stop_gradient(state.memory),
-        valid_len=jax.lax.stop_gradient(state.valid_len),
-        pos=jax.lax.stop_gradient(state.pos),
-    )
 
 
 class GRUGate(nnx.Module):
@@ -400,11 +391,12 @@ def calculate_gae(rewards, values, dones, next_value, next_done, gamma: float, l
 
 
 def loss_fn(model, batch, clip_eps, ent_coef):
-    obs, dones, actions, old_log_probs, advantages, returns, init_state = batch
-    logits_by_branch, values, final_state = model.unroll(obs, dones, init_state)
+    obs, dones, actions, old_log_probs, old_values, advantages, returns, init_state = batch
+    logits_by_branch, values, _ = model.unroll(obs, dones, init_state)
 
     actions = actions.astype(jnp.int32)
     old_log_probs = old_log_probs.astype(MODEL_DTYPE)
+    old_values = old_values.astype(MODEL_DTYPE)
     advantages = advantages.astype(MODEL_DTYPE)
     returns = returns.astype(MODEL_DTYPE)
     clip_eps = jnp.asarray(clip_eps, dtype=MODEL_DTYPE)
@@ -422,16 +414,22 @@ def loss_fn(model, batch, clip_eps, ent_coef):
         entropies.append(-jnp.sum(probs * log_probs, axis=-1))
 
     ratio = jnp.exp(selected_log_probs - old_log_probs)
-    actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
-    critic_loss = optax.huber_loss(values, jax.lax.stop_gradient(returns)).mean()
+    pg_loss_1 = -advantages * ratio
+    pg_loss_2 = -advantages * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+    actor_loss = jnp.maximum(pg_loss_1, pg_loss_2).mean()
+
+    value_unclipped = (values - returns) ** 2
+    value_clipped = old_values + jnp.clip(values - old_values, -clip_eps, clip_eps)
+    value_clipped_loss = (value_clipped - returns) ** 2
+    critic_loss = jnp.maximum(value_unclipped, value_clipped_loss).mean()
     entropy = jnp.sum(jnp.stack(entropies, axis=-1), axis=-1).mean()
 
     total_loss = actor_loss + jnp.asarray(0.5, dtype=MODEL_DTYPE) * critic_loss - ent_coef * entropy
-    return total_loss, (actor_loss, critic_loss, entropy, final_state)
+    return total_loss, (actor_loss, critic_loss, entropy)
 
 
-def make_minibatches(batch, initial_state: TrXLState, env_indices, envs_per_batch: int, segment_length: int):
-    obs, actions, old_log_probs, _, dones, _, advantages, returns = batch
+def make_minibatches(batch, segment_init_state: TrXLState, env_indices, envs_per_batch: int, segment_length: int):
+    obs, actions, old_log_probs, _, dones, old_values, advantages, returns = batch
     num_segments = obs.shape[0] // segment_length
 
     env_ids = jnp.asarray(env_indices, dtype=jnp.int32).reshape(-1, envs_per_batch)
@@ -446,12 +444,13 @@ def make_minibatches(batch, initial_state: TrXLState, env_indices, envs_per_batc
         split_time_and_env(dones),
         split_time_and_env(actions),
         split_time_and_env(old_log_probs),
+        split_time_and_env(old_values),
         split_time_and_env(advantages),
         split_time_and_env(returns),
         TrXLState(
-            memory=jnp.take(initial_state.memory, env_ids, axis=0),
-            valid_len=jnp.take(initial_state.valid_len, env_ids, axis=0),
-            pos=jnp.take(initial_state.pos, env_ids, axis=0),
+            memory=jnp.swapaxes(jnp.take(segment_init_state.memory, env_ids, axis=1), 0, 1),
+            valid_len=jnp.swapaxes(jnp.take(segment_init_state.valid_len, env_ids, axis=1), 0, 1),
+            pos=jnp.swapaxes(jnp.take(segment_init_state.pos, env_ids, axis=1), 0, 1),
         ),
     )
 
@@ -463,32 +462,43 @@ def update_ppo(model, optimizer, minibatches, metrics, clip_eps=0.2, ent_coef=0.
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
     def train_minibatch(carry, minibatch):
         model, optimizer, metrics = carry
-        obs_segments, dones_segments, actions_segments, old_log_probs_segments, advantages_segments, returns_segments, init_state = minibatch
+        (
+            obs_segments,
+            dones_segments,
+            actions_segments,
+            old_log_probs_segments,
+            old_values_segments,
+            advantages_segments,
+            returns_segments,
+            init_state_segments,
+        ) = minibatch
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
         def train_segment(carry, segment):
-            model, optimizer, metrics, state = carry
-            obs, dones, actions, old_log_probs, advantages, returns = segment
+            model, optimizer, metrics = carry
+            obs, dones, actions, old_log_probs, old_values, advantages, returns, init_state = segment
 
-            (_, (actor_loss, critic_loss, entropy, next_state)), grad = grad_fn(
+            (_, (actor_loss, critic_loss, entropy)), grad = grad_fn(
                 model,
-                (obs, dones, actions, old_log_probs, advantages, returns, state),
+                (obs, dones, actions, old_log_probs, old_values, advantages, returns, init_state),
                 clip_eps,
                 ent_coef,
             )
             optimizer.update(model, grad)
             metrics.update(actor_loss=actor_loss, critic_loss=critic_loss, entropy=entropy)
-            return model, optimizer, metrics, detach_state(next_state)
+            return model, optimizer, metrics
 
-        model, optimizer, metrics, _ = train_segment(
-            (model, optimizer, metrics, init_state),
+        model, optimizer, metrics = train_segment(
+            (model, optimizer, metrics),
             (
                 obs_segments,
                 dones_segments,
                 actions_segments,
                 old_log_probs_segments,
+                old_values_segments,
                 advantages_segments,
                 returns_segments,
+                init_state_segments,
             ),
         )
         return model, optimizer, metrics
@@ -611,10 +621,18 @@ def main():
     for iteration in range(args.num_iter):
         rollout_rewards = []
         rollout_lengths = []
-        initial_state = TrXLState(memory=state.memory, valid_len=state.valid_len, pos=state.pos)
+        segment_init_memory = []
+        segment_init_valid_len = []
+        segment_init_pos = []
 
-        for _ in range(args.num_steps):
-            log_prob, action, value, state = sample_action(model, obs, state, done, rngs)
+        for step in range(args.num_steps):
+            step_state = PPOGTrXL._reset_state_on_done(state, done)
+            if step % args.segment_length == 0:
+                segment_init_memory.append(step_state.memory)
+                segment_init_valid_len.append(step_state.valid_len)
+                segment_init_pos.append(step_state.pos)
+
+            log_prob, action, value, state = sample_action(model, obs, step_state, done, rngs)
             env_action = to_env_actions(action, is_discrete=is_discrete)
             next_obs, reward, terminated, truncated, info = envs.step(env_action)
             next_done = np.maximum(terminated, truncated).astype(np.float32)
@@ -630,6 +648,17 @@ def main():
 
             obs = next_obs
             done = next_done
+
+        num_segments = args.num_steps // args.segment_length
+        if len(segment_init_memory) != num_segments:
+            raise ValueError(
+                f"segment init states mismatch: expected {num_segments}, got {len(segment_init_memory)}"
+            )
+        segment_init_state = TrXLState(
+            memory=jnp.stack(segment_init_memory, axis=0),
+            valid_len=jnp.stack(segment_init_valid_len, axis=0),
+            pos=jnp.stack(segment_init_pos, axis=0),
+        )
 
         obs_batch, actions_batch, log_probs_batch, rewards_batch, dones_batch, values_batch = replay.as_jax()
 
@@ -659,7 +688,7 @@ def main():
             env_indices = np.asarray(jax.random.permutation(rngs(), args.num_envs))
             minibatches = make_minibatches(
                 train_batch,
-                initial_state,
+                segment_init_state,
                 env_indices[: args.num_minibatch * envs_per_batch],
                 envs_per_batch,
                 args.segment_length,
