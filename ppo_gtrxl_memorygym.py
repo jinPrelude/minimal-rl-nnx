@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import rlax
 import wandb
 
 
@@ -22,11 +23,11 @@ PARAM_DTYPE = jnp.bfloat16
 class ReplayBuffer:
     """Fixed-size rollout buffer for PPO."""
 
-    def __init__(self, num_steps: int, num_envs: int, obs_shape, action_dim: int):
+    def __init__(self, num_steps: int, num_envs: int, obs_shape):
         self.num_steps = num_steps
         self.num_envs = num_envs
         self.obs = np.zeros((num_steps, num_envs, *obs_shape), dtype=np.uint8)
-        self.actions = np.zeros((num_steps, num_envs, action_dim), dtype=np.int32)
+        self.actions = np.zeros((num_steps, num_envs), dtype=np.int32)
         self.log_probs = np.zeros((num_steps, num_envs), dtype=np.float32)
         self.rewards = np.zeros((num_steps, num_envs), dtype=np.float32)
         self.dones = np.zeros((num_steps, num_envs), dtype=np.float32)
@@ -69,6 +70,170 @@ class TrXLState(struct.PyTreeNode):
     pos: jax.Array          # [B]
 
 
+def clone_state(state: TrXLState) -> TrXLState:
+    return TrXLState(
+        memory=state.memory,
+        valid_len=state.valid_len,
+        pos=state.pos,
+    )
+
+
+def reset_done_in_state(state: TrXLState, done_mask) -> TrXLState:
+    done = jnp.asarray(done_mask, dtype=jnp.bool_)
+    keep = ~done
+    return TrXLState(
+        memory=state.memory * keep[:, None, None, None].astype(state.memory.dtype),
+        valid_len=state.valid_len * keep.astype(state.valid_len.dtype),
+        pos=state.pos * keep.astype(state.pos.dtype),
+    )
+
+
+def append_memory_token(state: TrXLState, token, max_episode_steps: int) -> TrXLState:
+    if token.ndim != 3:
+        raise ValueError(f"`token` must be rank-3 [B, L, D], got shape={token.shape}")
+    mem_len = state.memory.shape[1]
+    token = jnp.asarray(token, dtype=state.memory.dtype)
+    return TrXLState(
+        memory=jnp.concatenate([state.memory[:, 1:], token[:, None, :, :]], axis=1),
+        valid_len=jnp.minimum(state.valid_len + 1, mem_len),
+        pos=jnp.minimum(state.pos + 1, max_episode_steps),
+    )
+
+
+def build_memory_inputs(state: TrXLState, mem_len: int):
+    memory_idx = jnp.arange(mem_len, dtype=jnp.int32)[None, :]
+    memory_mask = memory_idx >= (mem_len - state.valid_len[:, None])
+    return state.memory, memory_mask
+
+
+def build_parallel_eval_metadata(dones_seq, init_state: TrXLState, mem_len: int, max_episode_steps: int):
+    del max_episode_steps
+    done = jnp.swapaxes(jnp.asarray(dones_seq, dtype=jnp.bool_), 0, 1)  # [B, T]
+    batch_size, seq_len = done.shape
+
+    t = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+    m = jnp.arange(mem_len, dtype=jnp.int32)[None, :]
+    init_pos = init_state.pos.astype(jnp.int32)
+    init_valid_len = init_state.valid_len.astype(jnp.int32)
+
+    episode_ids = jnp.cumsum(done.astype(jnp.int32), axis=1)  # [B, T]
+    reset_points = jnp.where(done, jnp.broadcast_to(t, (batch_size, seq_len)), -jnp.ones((batch_size, seq_len), dtype=jnp.int32))
+    last_reset = jnp.maximum.accumulate(reset_points, axis=1)
+    query_pos_unclamped = jnp.where(episode_ids == 0, init_pos[:, None] + t, t - last_reset)
+
+    memory_valid = m >= (mem_len - init_valid_len[:, None])
+    memory_pos_unclamped = init_pos[:, None] + m - mem_len
+
+    memory_episode_ids = jnp.where(memory_valid, jnp.zeros_like(memory_pos_unclamped), -jnp.ones_like(memory_pos_unclamped))
+    memory_key_pos = jnp.where(
+        memory_valid,
+        memory_pos_unclamped,
+        jnp.full_like(memory_pos_unclamped, -1_000_000_000),
+    )
+    key_episode_ids = jnp.concatenate([memory_episode_ids, episode_ids], axis=1)  # [B, M+T]
+    key_pos = jnp.concatenate([memory_key_pos, query_pos_unclamped], axis=1)  # [B, M+T]
+
+    query_pos = query_pos_unclamped[:, :, None]  # [B, T, 1]
+    return (
+        (key_episode_ids[:, None, :] == episode_ids[:, :, None])
+        & (key_pos[:, None, :] <= query_pos)
+        & (key_pos[:, None, :] >= query_pos - mem_len)
+    )
+
+
+class RelativeMultiHeadAttention(nnx.Module):
+    def __init__(self, embed_dim: int, num_heads: int, *, rngs: nnx.Rngs):
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"embed_dim must be divisible by num_heads, got {embed_dim}, {num_heads}")
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_size = embed_dim // num_heads
+        self.values = nnx.Linear(self.head_size, self.head_size, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.keys = nnx.Linear(self.head_size, self.head_size, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.queries = nnx.Linear(self.head_size, self.head_size, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.r_proj = nnx.Linear(embed_dim, num_heads * self.head_size, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.u_bias = nnx.Param(jnp.zeros((num_heads, self.head_size), dtype=MODEL_DTYPE))
+        self.v_bias = nnx.Param(jnp.zeros((num_heads, self.head_size), dtype=MODEL_DTYPE))
+        self.fc_out = nnx.Linear(num_heads * self.head_size, embed_dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        freqs = jnp.arange(0, embed_dim, 2, dtype=MODEL_DTYPE)
+        self.inv_freqs = 10_000.0 ** (-freqs / embed_dim)
+
+    def _relative_sinusoid_embedding(self, num_positions: int, dtype):
+        seq = jnp.arange(num_positions, dtype=self.inv_freqs.dtype)[:, None]
+        sinusoidal_inp = seq * self.inv_freqs[None, :]
+        return jnp.concatenate([jnp.sin(sinusoidal_inp), jnp.cos(sinusoidal_inp)], axis=-1).astype(dtype)
+
+    def _relative_keys(self, query_len: int, key_len: int, query_offset: int | None, dtype):
+        if query_offset is None:
+            query_offset = key_len
+        if query_offset < 0:
+            raise ValueError(f"`query_offset` must be >= 0, got {query_offset}")
+
+        max_distance = key_len + query_len
+        query_positions = jnp.arange(query_len, dtype=jnp.int32)[:, None] + query_offset
+        key_positions = jnp.arange(key_len, dtype=jnp.int32)[None, :]
+        relative_positions = jnp.clip(query_positions - key_positions, a_min=0, a_max=max_distance - 1)
+
+        rel_sinusoid = self._relative_sinusoid_embedding(max_distance, dtype=dtype)
+        rel_keys = self.r_proj(rel_sinusoid).reshape(max_distance, self.num_heads, self.head_size)
+        return rel_keys[relative_positions]
+
+    def __call__(self, values, keys, query, mask, query_offset: int | None = None, self_kv=None):
+        batch_size = query.shape[0]
+        value_len, key_len, query_len = values.shape[1], keys.shape[1], query.shape[1]
+
+        values = values.reshape(batch_size, value_len, self.num_heads, self.head_size)
+        keys = keys.reshape(batch_size, key_len, self.num_heads, self.head_size)
+        query = query.reshape(batch_size, query_len, self.num_heads, self.head_size)
+
+        values = self.values(values)
+        keys = self.keys(keys)
+        queries = self.queries(query)
+        rel_keys = self._relative_keys(query_len, key_len, query_offset, queries.dtype)
+
+        mem_content_energy = jnp.einsum("nqhd,nkhd->nhqk", queries + self.u_bias[...], keys)
+        mem_position_energy = jnp.einsum("nqhd,qkhd->nhqk", queries + self.v_bias[...], rel_keys)
+        mem_energy = mem_content_energy + mem_position_energy
+        scale = jnp.sqrt(jnp.asarray(self.head_size, dtype=queries.dtype))
+        mask_fill = jnp.asarray(-1e30, dtype=mem_energy.dtype)
+
+        if self_kv is None:
+            if mask is not None:
+                mem_energy = jnp.where(mask[:, None, :, :], mem_energy, mask_fill)
+            attention = jax.nn.softmax(mem_energy / scale, axis=3)
+            out = jnp.einsum("nhql,nlhd->nqhd", attention, values).reshape(batch_size, query_len, self.num_heads * self.head_size)
+            return self.fc_out(out), attention
+
+        if query_len != 1:
+            raise ValueError("`self_kv` fast path expects query_len == 1")
+        if mask is not None and mask.ndim != 2:
+            raise ValueError("`self_kv` fast path expects rank-2 mask [B, K]")
+
+        self_kv = self_kv.reshape(batch_size, 1, self.num_heads, self.head_size)
+        self_values = self.values(self_kv)
+        self_keys = self.keys(self_kv)
+
+        rel0 = self._relative_sinusoid_embedding(key_len + query_len, dtype=queries.dtype)[:1]
+        rel0 = self.r_proj(rel0).reshape(1, 1, self.num_heads, self.head_size)
+
+        self_content_energy = jnp.einsum("nqhd,nkhd->nhqk", queries + self.u_bias[...], self_keys)
+        self_position_energy = jnp.einsum("nqhd,qkhd->nhqk", queries + self.v_bias[...], rel0)
+        self_energy = self_content_energy + self_position_energy
+
+        if mask is not None:
+            mem_energy = jnp.where(mask[:, None, None, :], mem_energy, mask_fill)
+
+        energy = jnp.concatenate([mem_energy, self_energy], axis=3)
+        attention = jax.nn.softmax(energy / scale, axis=3)
+        attn_mem = attention[..., :key_len]
+        attn_self = attention[..., key_len:]
+
+        out_mem = jnp.einsum("nhql,nlhd->nqhd", attn_mem, values)
+        out_self = jnp.einsum("nhql,nlhd->nqhd", attn_self, self_values)
+        out = (out_mem + out_self).reshape(batch_size, query_len, self.num_heads * self.head_size)
+        return self.fc_out(out), attention
+
+
 class GRUGate(nnx.Module):
     def __init__(self, dim: int, bias_init: float = 2.0, *, rngs: nnx.Rngs):
         self.w_r = nnx.Linear(dim, dim, use_bias=False, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
@@ -91,41 +256,23 @@ class GTrXLBlock(nnx.Module):
         if dim % num_heads != 0:
             raise ValueError(f"dim must be divisible by num_heads, got dim={dim}, num_heads={num_heads}")
 
-        self.attn_norm = nnx.LayerNorm(num_features=dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.layer_norm_q = nnx.LayerNorm(num_features=dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.norm_kv = nnx.LayerNorm(num_features=dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
         self.ffn_norm = nnx.LayerNorm(num_features=dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
-
-        self.attn = nnx.MultiHeadAttention(
-            num_heads=num_heads,
-            in_features=dim,
-            qkv_features=dim,
-            out_features=dim,
-            dtype=MODEL_DTYPE,
-            param_dtype=PARAM_DTYPE,
-            dropout_rate=0.0,
-            decode=False,
-            use_bias=False,
-            rngs=rngs,
-        )
-        self.ffn = nnx.Linear(dim, dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        self.attention = RelativeMultiHeadAttention(dim, num_heads, rngs=rngs)
+        self.fc = nnx.Linear(dim, dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
 
         self.attn_gate = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
         self.ffn_gate = GRUGate(dim, bias_init=gate_bias_init, rngs=rngs)
 
-    def __call__(self, memory, query, mask):
-        if mask.ndim == 2:
-            attn_mask = mask[:, None, None, :]
-        elif mask.ndim == 3:
-            attn_mask = mask[:, None, :, :]
-        else:
-            raise ValueError(f"memory_mask must be rank-2 or rank-3, got {mask.ndim}")
-
-        mem = self.attn_norm(memory)
-        q = self.attn_norm(query)
-
-        attn_out = self.attn(q, mem, mem, mask=attn_mask, deterministic=True)
+    def __call__(self, kv, query, mask, query_offset: int | None = None, self_kv=None):
+        query_ = self.layer_norm_q(query)
+        kv = self.norm_kv(kv)
+        if self_kv is not None:
+            self_kv = self.norm_kv(self_kv)
+        attn_out, _ = self.attention(kv, kv, query_, mask, query_offset=query_offset, self_kv=self_kv)
         x = self.attn_gate(query, nnx.relu(attn_out))
-
-        ffn_out = self.ffn(self.ffn_norm(x))
+        ffn_out = self.fc(self.ffn_norm(x))
         x = self.ffn_gate(x, nnx.relu(ffn_out))
         return x
 
@@ -133,30 +280,30 @@ class GTrXLBlock(nnx.Module):
 class PPOGTrXL(nnx.Module):
     def __init__(
         self,
-        obs_shape,
-        action_dims,
+        obs_shape: tuple[int, int, int],
+        num_actions: int,
         trxl_dim: int,
         trxl_num_layers: int,
         trxl_num_heads: int,
         trxl_memory_length: int,
         gtrxl_gate_bias_init: float,
+        max_episode_steps: int,
         *,
         rngs: nnx.Rngs,
     ):
         if trxl_dim % 2 != 0:
             raise ValueError(f"trxl_dim must be even for sinusoidal encoding, got {trxl_dim}")
-        if tuple(obs_shape) != (84, 84, 3):
-            raise ValueError(f"MemoryGym expected obs shape (84, 84, 3), got {obs_shape}")
-        if len(action_dims) < 1 or any(int(n) <= 1 for n in action_dims):
-            raise ValueError(f"Invalid action_dims={action_dims}")
+        if len(obs_shape) != 3:
+            raise ValueError(f"`obs_shape` must be rank-3 HWC image shape, got {obs_shape}")
 
+        self.obs_shape = obs_shape
         self.hidden_dim = trxl_dim
         self.num_layers = trxl_num_layers
         self.memory_len = trxl_memory_length
-        self.action_dims = tuple(int(n) for n in action_dims)
+        self.max_episode_steps = max_episode_steps
 
         self.conv1 = nnx.Conv(
-            in_features=obs_shape[2],
+            in_features=obs_shape[-1],
             out_features=32,
             kernel_size=(8, 8),
             strides=(4, 4),
@@ -185,20 +332,24 @@ class PPOGTrXL(nnx.Module):
             param_dtype=PARAM_DTYPE,
             rngs=rngs,
         )
-        self.encoder = nnx.Linear(3136, trxl_dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
+        dummy = jnp.zeros((1, *obs_shape), dtype=MODEL_DTYPE)
+        dummy = nnx.relu(self.conv1(dummy))
+        dummy = nnx.relu(self.conv2(dummy))
+        dummy = nnx.relu(self.conv3(dummy))
+        self.encoder = nnx.Linear(
+            int(np.prod(dummy.shape[1:])),
+            trxl_dim,
+            dtype=MODEL_DTYPE,
+            param_dtype=PARAM_DTYPE,
+            rngs=rngs,
+        )
         self.layers = nnx.List([
             GTrXLBlock(trxl_dim, trxl_num_heads, gtrxl_gate_bias_init, rngs=rngs)
             for _ in range(trxl_num_layers)
         ])
         self.post_trxl = nnx.Linear(trxl_dim, trxl_dim, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
-        self.policy_heads = nnx.List([
-            nnx.Linear(trxl_dim, n, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
-            for n in self.action_dims
-        ])
+        self.policy_head = nnx.Linear(trxl_dim, num_actions, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
         self.value_head = nnx.Linear(trxl_dim, 1, dtype=MODEL_DTYPE, param_dtype=PARAM_DTYPE, rngs=rngs)
-
-        freqs = jnp.arange(0, trxl_dim, 2, dtype=MODEL_DTYPE)
-        self.inv_freq = 10_000.0 ** (-freqs / trxl_dim)
 
     def init_state(self, batch_size: int) -> TrXLState:
         return TrXLState(
@@ -208,169 +359,91 @@ class PPOGTrXL(nnx.Module):
         )
 
     def _encode_obs(self, obs):
-        x = jnp.asarray(obs, dtype=MODEL_DTYPE) / 255.0
-        x = nnx.relu(self.conv1(x))
-        x = nnx.relu(self.conv2(x))
-        x = nnx.relu(self.conv3(x))
-        x = x.reshape(*x.shape[:-3], -1)
-        return self.encoder(x)
-
-    def _pos_emb(self, positions):
-        positions = jnp.maximum(positions, 0).astype(MODEL_DTYPE)
-        sinusoid = positions[..., None] * self.inv_freq[None, :]
-        return jnp.concatenate([jnp.sin(sinusoid), jnp.cos(sinusoid)], axis=-1)
-
-    @staticmethod
-    def _reset_state_on_done(state: TrXLState, done):
-        done = jnp.asarray(done, dtype=jnp.int32)
-        mask_int = 1 - done
-        mask_float = mask_int.astype(state.memory.dtype)
-        return TrXLState(
-            memory=state.memory * mask_float[:, None, None, None],
-            valid_len=state.valid_len * mask_int,
-            pos=state.pos * mask_int,
-        )
+        x = jnp.asarray(obs, dtype=MODEL_DTYPE) / jnp.asarray(255.0, dtype=MODEL_DTYPE)
+        if x.ndim == 4:
+            x = nnx.relu(self.conv1(x))
+            x = nnx.relu(self.conv2(x))
+            x = nnx.relu(self.conv3(x))
+            x = x.reshape((x.shape[0], -1))
+            return nnx.relu(self.encoder(x))
+        if x.ndim == 5:
+            t, b = x.shape[:2]
+            x = x.reshape((t * b, *self.obs_shape))
+            x = nnx.relu(self.conv1(x))
+            x = nnx.relu(self.conv2(x))
+            x = nnx.relu(self.conv3(x))
+            x = x.reshape((t * b, -1))
+            x = nnx.relu(self.encoder(x))
+            return x.reshape((t, b, -1))
+        raise ValueError(f"`obs` must be rank-4 or rank-5 image batch, got shape={x.shape}")
 
     def _step_core(self, state: TrXLState, x_t):
-        memory_idx = jnp.arange(self.memory_len, dtype=jnp.int32)[None, :]
-        memory_mask = memory_idx >= (self.memory_len - state.valid_len[:, None])
-
-        memory_pos = state.pos[:, None] + memory_idx - self.memory_len
-        memories = state.memory + self._pos_emb(memory_pos)[:, :, None, :]
-
+        memory_window, memory_mask = build_memory_inputs(state, self.memory_len)
         x = x_t
         layer_inputs = []
         for i, layer in enumerate(self.layers):
             layer_inputs.append(x)
-            x = layer(memories[:, :, i], x[:, None, :], memory_mask)
+            q = x[:, None, :]
+            x = layer(
+                memory_window[:, :, i],
+                q,
+                memory_mask,
+                query_offset=self.memory_len,
+                self_kv=q,
+            )
             x = x.squeeze(1)
-
-        new_tokens = jnp.stack(layer_inputs, axis=1)
-        new_memory = jnp.concatenate([state.memory[:, 1:], new_tokens[:, None, :, :]], axis=1)
-
-        new_state = TrXLState(
-            memory=new_memory,
-            valid_len=jnp.minimum(state.valid_len + 1, self.memory_len),
-            pos=state.pos + 1,
-        )
-        return new_state, x
+        return append_memory_token(state, jnp.stack(layer_inputs, axis=1), self.max_episode_steps), x
 
     def step(self, obs, state: TrXLState, done):
         x = self._encode_obs(obs)
-        state = self._reset_state_on_done(state, done)
+        state = reset_done_in_state(state, done)
         state, hidden = self._step_core(state, x)
 
         hidden = nnx.relu(self.post_trxl(hidden))
-        logits = [head(hidden) for head in self.policy_heads]
+        logits = self.policy_head(hidden)
         value = self.value_head(hidden).squeeze(-1)
         return logits, value, state
 
-    def _unroll_metadata(self, done, init_state: TrXLState):
-        _, num_steps = done.shape
-        memory_len = self.memory_len
-
-        t = jnp.arange(num_steps, dtype=jnp.int32)[None, :]
-        m = jnp.arange(memory_len, dtype=jnp.int32)[None, :]
-
-        episode = jnp.cumsum(done, axis=1)
-        last_reset = jnp.maximum.accumulate(
-            jnp.where(done == 1, t, -jnp.ones_like(t)),
-            axis=1,
-        )
-
-        query_pos = jnp.where(
-            episode == 0,
-            init_state.pos[:, None] + t,
-            t - last_reset,
-        )
-
-        mem_valid = m >= (memory_len - init_state.valid_len[:, None])
-        mem_pos = init_state.pos[:, None] + m - memory_len
-
-        key_episode = jnp.concatenate([jnp.where(mem_valid, 0, -1), episode], axis=1)
-        key_pos = jnp.concatenate([jnp.where(mem_valid, mem_pos, -memory_len - 1), query_pos], axis=1)
-
-        attn_mask = (
-            (key_episode[:, None, :] == episode[:, :, None])
-            & (key_pos[:, None, :] < query_pos[:, :, None])
-            & (key_pos[:, None, :] >= query_pos[:, :, None] - memory_len)
-        )
-
-        final_valid_len = jnp.where(
-            episode[:, -1] == 0,
-            init_state.valid_len + num_steps,
-            num_steps - last_reset[:, -1],
-        )
-        final_valid_len = jnp.minimum(final_valid_len, memory_len)
-        final_pos = query_pos[:, -1] + 1
-        return mem_pos, query_pos, attn_mask, final_valid_len, final_pos
-
     def unroll(self, obs_seq, done_seq, init_state: TrXLState):
         x = jnp.swapaxes(self._encode_obs(obs_seq), 0, 1)  # [B, T, D]
-        done = jnp.swapaxes(jnp.asarray(done_seq, dtype=jnp.int32), 0, 1)  # [B, T]
-        memory_pos, query_pos, attn_mask, final_valid_len, final_pos = self._unroll_metadata(done, init_state)
+        attn_mask = build_parallel_eval_metadata(done_seq, init_state, self.memory_len, self.max_episode_steps)
+        fallback_kv_token = jnp.zeros((1, 1, x.shape[-1]), dtype=x.dtype)
 
-        query_pos_emb = self._pos_emb(query_pos)
-        memory_pos_emb = self._pos_emb(memory_pos)
-
-        layer_inputs = []
         for i, layer in enumerate(self.layers):
-            layer_inputs.append(x)
-            kv = jnp.concatenate(
-                [
-                    init_state.memory[:, :, i] + memory_pos_emb,
-                    x + query_pos_emb,
-                ],
-                axis=1,
+            kv = jnp.concatenate([init_state.memory[:, :, i], x], axis=1)
+            no_key_rows = ~jnp.any(attn_mask, axis=2, keepdims=True)
+            dummy_kv = jnp.broadcast_to(fallback_kv_token, (kv.shape[0], 1, kv.shape[2]))
+            kv = jnp.concatenate([dummy_kv, kv], axis=1)
+            layer_mask = jnp.concatenate([no_key_rows, attn_mask], axis=2)
+            x = layer(
+                kv,
+                x,
+                layer_mask,
+                query_offset=kv.shape[1] - x.shape[1],
             )
-            x = layer(kv, x, attn_mask)
 
         hidden = nnx.relu(self.post_trxl(x))
-        logits = [jnp.swapaxes(head(hidden), 0, 1) for head in self.policy_heads]
+        logits = jnp.swapaxes(self.policy_head(hidden), 0, 1)
         values = jnp.swapaxes(self.value_head(hidden).squeeze(-1), 0, 1)
-
-        final_layers = []
-        for i in range(self.num_layers):
-            tokens = jnp.concatenate([init_state.memory[:, :, i], layer_inputs[i]], axis=1)
-            final_layers.append(tokens[:, -self.memory_len :, :])
-        tail = jnp.stack(final_layers, axis=2)
-
-        tail_mask = (
-            jnp.arange(self.memory_len, dtype=jnp.int32)[None, :]
-            >= (self.memory_len - final_valid_len[:, None])
-        )
-
-        final_state = TrXLState(
-            memory=jnp.where(tail_mask[:, :, None, None], tail, jnp.zeros_like(tail)),
-            valid_len=final_valid_len,
-            pos=final_pos,
-        )
-        return logits, values, final_state
+        return logits, values
 
 
 @nnx.jit
 def sample_action(model, obs, state, done, rngs):
-    logits_by_branch, value, new_state = model.step(obs, state, done)
+    logits, value, new_state = model.step(obs, state, done)
+    # Keep sampling numerics in float32 for precision; but not strictly tested.
+    logits = logits.astype(jnp.float32)
     value = value.astype(jnp.float32)
-
-    actions = []
-    log_probs = []
-    for logits in logits_by_branch:
-        branch_logits = logits.astype(jnp.float32)
-        branch_log_probs = jax.nn.log_softmax(branch_logits, axis=-1)
-        branch_actions = rngs.categorical(branch_logits, axis=-1).astype(jnp.int32)
-        sampled_log_prob = jnp.take_along_axis(branch_log_probs, branch_actions[..., None], axis=-1).squeeze(-1)
-        actions.append(branch_actions)
-        log_probs.append(sampled_log_prob)
-
-    actions = jnp.stack(actions, axis=-1)
-    log_probs = jnp.sum(jnp.stack(log_probs, axis=-1), axis=-1)
-    return log_probs, actions, value, new_state
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    actions = rngs.categorical(logits, axis=-1)
+    sampled_log_prob = jnp.take_along_axis(log_probs, actions[..., None], axis=-1).squeeze(-1)
+    return sampled_log_prob, actions, value, new_state
 
 
 @nnx.jit
 def bootstrap_value(model, obs, state, done):
     _, value, _ = model.step(obs, state, done)
+    # Keep bootstrap values in float32 for precision; but not strictly tested.
     return value.astype(jnp.float32)
 
 
@@ -391,45 +464,29 @@ def calculate_gae(rewards, values, dones, next_value, next_done, gamma: float, l
 
 
 def loss_fn(model, batch, clip_eps, ent_coef):
-    obs, dones, actions, old_log_probs, old_values, advantages, returns, init_state = batch
-    logits_by_branch, values, _ = model.unroll(obs, dones, init_state)
+    obs, dones, actions, old_log_probs, advantages, returns, init_state = batch
+    logits, values = model.unroll(obs, dones, init_state)
 
-    actions = actions.astype(jnp.int32)
     old_log_probs = old_log_probs.astype(MODEL_DTYPE)
-    old_values = old_values.astype(MODEL_DTYPE)
     advantages = advantages.astype(MODEL_DTYPE)
     returns = returns.astype(MODEL_DTYPE)
     clip_eps = jnp.asarray(clip_eps, dtype=MODEL_DTYPE)
     ent_coef = jnp.asarray(ent_coef, dtype=MODEL_DTYPE)
 
-    selected_log_probs = jnp.zeros_like(old_log_probs)
-    entropies = []
-    for i, logits in enumerate(logits_by_branch):
-        logits = logits.astype(MODEL_DTYPE)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        probs = jax.nn.softmax(logits, axis=-1)
-        branch_actions = actions[..., i : i + 1]
-        selected = jnp.take_along_axis(log_probs, branch_actions, axis=-1).squeeze(-1)
-        selected_log_probs = selected_log_probs + selected
-        entropies.append(-jnp.sum(probs * log_probs, axis=-1))
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    selected_log_probs = jnp.take_along_axis(log_probs, actions[..., None], axis=-1).squeeze(-1)
 
     ratio = jnp.exp(selected_log_probs - old_log_probs)
-    pg_loss_1 = -advantages * ratio
-    pg_loss_2 = -advantages * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-    actor_loss = jnp.maximum(pg_loss_1, pg_loss_2).mean()
-
-    value_unclipped = (values - returns) ** 2
-    value_clipped = old_values + jnp.clip(values - old_values, -clip_eps, clip_eps)
-    value_clipped_loss = (value_clipped - returns) ** 2
-    critic_loss = jnp.maximum(value_unclipped, value_clipped_loss).mean()
-    entropy = jnp.sum(jnp.stack(entropies, axis=-1), axis=-1).mean()
+    actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
+    critic_loss = optax.huber_loss(values, jax.lax.stop_gradient(returns)).mean()
+    entropy = -jnp.sum(jax.nn.softmax(logits, axis=-1) * log_probs, axis=-1).mean()
 
     total_loss = actor_loss + jnp.asarray(0.5, dtype=MODEL_DTYPE) * critic_loss - ent_coef * entropy
     return total_loss, (actor_loss, critic_loss, entropy)
 
 
-def make_minibatches(batch, segment_init_state: TrXLState, env_indices, envs_per_batch: int, segment_length: int):
-    obs, actions, old_log_probs, _, dones, old_values, advantages, returns = batch
+def make_minibatches(batch, segment_init_states, env_indices, envs_per_batch: int, segment_length: int):
+    obs, actions, old_log_probs, _, dones, _, advantages, returns = batch
     num_segments = obs.shape[0] // segment_length
 
     env_ids = jnp.asarray(env_indices, dtype=jnp.int32).reshape(-1, envs_per_batch)
@@ -439,18 +496,21 @@ def make_minibatches(batch, segment_init_state: TrXLState, env_indices, envs_per
         x = jnp.swapaxes(x, 0, 1)            # [MB, T, E, ...]
         return x.reshape(x.shape[0], num_segments, segment_length, *x.shape[2:])
 
+    seg_memory = jnp.stack([s.memory for s in segment_init_states], axis=0)      # [S, B, M, L, D]
+    seg_valid_len = jnp.stack([s.valid_len for s in segment_init_states], axis=0)  # [S, B]
+    seg_pos = jnp.stack([s.pos for s in segment_init_states], axis=0)            # [S, B]
+
     return (
         split_time_and_env(obs),
         split_time_and_env(dones),
         split_time_and_env(actions),
         split_time_and_env(old_log_probs),
-        split_time_and_env(old_values),
         split_time_and_env(advantages),
         split_time_and_env(returns),
         TrXLState(
-            memory=jnp.swapaxes(jnp.take(segment_init_state.memory, env_ids, axis=1), 0, 1),
-            valid_len=jnp.swapaxes(jnp.take(segment_init_state.valid_len, env_ids, axis=1), 0, 1),
-            pos=jnp.swapaxes(jnp.take(segment_init_state.pos, env_ids, axis=1), 0, 1),
+            memory=jnp.swapaxes(jnp.take(seg_memory, env_ids, axis=1), 0, 1),      # [MB, S, E, M, L, D]
+            valid_len=jnp.swapaxes(jnp.take(seg_valid_len, env_ids, axis=1), 0, 1),  # [MB, S, E]
+            pos=jnp.swapaxes(jnp.take(seg_pos, env_ids, axis=1), 0, 1),            # [MB, S, E]
         ),
     )
 
@@ -462,25 +522,16 @@ def update_ppo(model, optimizer, minibatches, metrics, clip_eps=0.2, ent_coef=0.
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
     def train_minibatch(carry, minibatch):
         model, optimizer, metrics = carry
-        (
-            obs_segments,
-            dones_segments,
-            actions_segments,
-            old_log_probs_segments,
-            old_values_segments,
-            advantages_segments,
-            returns_segments,
-            init_state_segments,
-        ) = minibatch
+        obs_segments, dones_segments, actions_segments, old_log_probs_segments, advantages_segments, returns_segments, init_states = minibatch
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
         def train_segment(carry, segment):
             model, optimizer, metrics = carry
-            obs, dones, actions, old_log_probs, old_values, advantages, returns, init_state = segment
+            obs, dones, actions, old_log_probs, advantages, returns, init_state = segment
 
             (_, (actor_loss, critic_loss, entropy)), grad = grad_fn(
                 model,
-                (obs, dones, actions, old_log_probs, old_values, advantages, returns, init_state),
+                (obs, dones, actions, old_log_probs, advantages, returns, init_state),
                 clip_eps,
                 ent_coef,
             )
@@ -495,10 +546,9 @@ def update_ppo(model, optimizer, minibatches, metrics, clip_eps=0.2, ent_coef=0.
                 dones_segments,
                 actions_segments,
                 old_log_probs_segments,
-                old_values_segments,
                 advantages_segments,
                 returns_segments,
-                init_state_segments,
+                init_states,
             ),
         )
         return model, optimizer, metrics
@@ -506,26 +556,11 @@ def update_ppo(model, optimizer, minibatches, metrics, clip_eps=0.2, ent_coef=0.
     train_minibatch((model, optimizer, metrics), minibatches)
 
 
-def parse_action_space(action_space):
-    if isinstance(action_space, gym.spaces.Discrete):
-        return [int(action_space.n)], True
-    if isinstance(action_space, gym.spaces.MultiDiscrete):
-        return [int(n) for n in np.asarray(action_space.nvec).tolist()], False
-    raise ValueError(
-        "Unsupported action space for MemoryGym. "
-        f"Expected Discrete or MultiDiscrete, got {type(action_space).__name__}."
-    )
-
-
-def to_env_actions(actions, is_discrete: bool):
-    actions = np.asarray(actions, dtype=np.int32)
-    return actions[:, 0] if is_discrete else actions
-
-
 def parse_args():
     parser = ArgumentParser()
 
     parser.add_argument("--env-name", type=str, default="MortarMayhem-Grid-v0")
+    parser.add_argument("--render-mode", type=str, default="debug_rgb_array")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iter", type=int, default=100000)
     parser.add_argument("--num-steps", type=int, default=512)
@@ -536,31 +571,25 @@ def parse_args():
 
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--lmbda", type=float, default=0.95)
-    parser.add_argument("--learning-rate", type=float, default=0.00025)
+    parser.add_argument("--learning-rate", type=float, default=2.5e-4)
     parser.add_argument("--clip-eps", type=float, default=0.1)
-    parser.add_argument("--ent-coef", type=float, default=0.0001)
+    parser.add_argument("--ent-coef", type=float, default=1e-4)
 
     parser.add_argument("--trxl-dim", type=int, default=384)
     parser.add_argument("--trxl-num-layers", type=int, default=3)
     parser.add_argument("--trxl-num-heads", type=int, default=4)
-    parser.add_argument("--trxl-memory-length", type=int, default=119)
+    parser.add_argument("--trxl-memory-length", type=int, default=88)
     parser.add_argument("--gtrxl-gate-bias-init", type=float, default=2.0)
     return parser.parse_args()
 
 
 def validate_args(args):
-    if args.num_minibatch < 1:
-        raise ValueError("num-minibatch must be >= 1")
-    if args.num_envs % args.num_minibatch != 0:
-        raise ValueError("num-envs must be divisible by num-minibatch")
-    if args.segment_length <= 0:
-        raise ValueError("segment-length must be > 0")
-    if args.num_steps % args.segment_length != 0:
-        raise ValueError("num-steps must be divisible by segment-length")
-    if args.trxl_dim % args.trxl_num_heads != 0:
-        raise ValueError("trxl-dim must be divisible by trxl-num-heads")
-    if args.trxl_memory_length <= 0:
-        raise ValueError("trxl-memory-length must be > 0")
+    assert args.num_minibatch >= 1
+    assert args.num_envs % args.num_minibatch == 0
+    assert args.segment_length > 0
+    assert args.num_steps % args.segment_length == 0
+    assert args.trxl_dim % args.trxl_num_heads == 0
+    assert args.trxl_memory_length > 0
 
 
 def main():
@@ -570,32 +599,45 @@ def main():
     envs_per_batch = args.num_envs // args.num_minibatch
     rngs = nnx.Rngs(args.seed)
 
+    # Init environment
     envs = gym.make_vec(
         args.env_name,
         num_envs=args.num_envs,
         vectorization_mode="sync",
+        render_mode=args.render_mode,
     )
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
 
     obs_space = envs.single_observation_space
+    act_space = envs.single_action_space
     if not isinstance(obs_space, gym.spaces.Box):
-        raise ValueError(f"MemoryGym expected Box observation space, got {type(obs_space).__name__}")
-    if obs_space.shape != (84, 84, 3):
-        raise ValueError(f"MemoryGym expected observation shape (84, 84, 3), got {obs_space.shape}")
+        raise ValueError(f"Only image Box observation is supported, got {obs_space}")
+    if len(obs_space.shape) != 3:
+        raise ValueError(f"Observation must be HWC image shape, got {obs_space.shape}")
     if obs_space.dtype != np.uint8:
-        raise ValueError(f"MemoryGym expected uint8 observation dtype, got {obs_space.dtype}")
+        raise ValueError(f"Observation dtype must be uint8 image, got {obs_space.dtype}")
+    if not isinstance(act_space, gym.spaces.Discrete):
+        raise ValueError(f"Only Discrete action space is supported, got {act_space}")
+    if "Grid" not in args.env_name:
+        raise ValueError(f"`env-name` must contain 'Grid' for grid-only support, got {args.env_name}")
 
-    action_dims, is_discrete = parse_action_space(envs.single_action_space)
-    memory_len = args.trxl_memory_length
+    vector_env = envs.env if hasattr(envs, "env") else envs
+    vector_env.envs[0].reset(seed=args.seed)
+    max_episode_steps = int(vector_env.envs[0].get_wrapper_attr("max_episode_steps"))
+    if max_episode_steps <= 0:
+        max_episode_steps = 1024
+    memory_len = min(args.trxl_memory_length, max_episode_steps)
 
+    # Init model, optimizer, and metrics
     model = PPOGTrXL(
         obs_shape=obs_space.shape,
-        action_dims=action_dims,
+        num_actions=act_space.n,
         trxl_dim=args.trxl_dim,
         trxl_num_layers=args.trxl_num_layers,
         trxl_num_heads=args.trxl_num_heads,
         trxl_memory_length=memory_len,
         gtrxl_gate_bias_init=args.gtrxl_gate_bias_init,
+        max_episode_steps=max_episode_steps,
         rngs=rngs,
     )
     optimizer = nnx.Optimizer(model, optax.adamw(args.learning_rate), wrt=nnx.Param)
@@ -608,61 +650,53 @@ def main():
     wandb.init(
         project="minimal-flaxrl",
         name=f"ppo_gtrxl_memorygym_{args.env_name}",
-        config={**vars(args), "trxl_memory_length": memory_len, "action_dims": action_dims},
+        config={**vars(args), "trxl_memory_length": memory_len, "max_episode_steps": max_episode_steps},
     )
 
+    # reset environment & init replay buffer
     obs, _ = envs.reset(seed=args.seed)
     state = model.init_state(args.num_envs)
     done = np.zeros(args.num_envs, dtype=np.float32)
-    replay = ReplayBuffer(args.num_steps, args.num_envs, obs_space.shape, action_dim=len(action_dims))
+    replay = ReplayBuffer(args.num_steps, args.num_envs, obs_space.shape)
 
     global_env_step = 0
     start_time = time.time()
     for iteration in range(args.num_iter):
         rollout_rewards = []
         rollout_lengths = []
-        segment_init_memory = []
-        segment_init_valid_len = []
-        segment_init_pos = []
+        segment_init_states = [None] * (args.num_steps // args.segment_length)
 
         for step in range(args.num_steps):
-            step_state = PPOGTrXL._reset_state_on_done(state, done)
+            state_for_step = reset_done_in_state(state, done)
             if step % args.segment_length == 0:
-                segment_init_memory.append(step_state.memory)
-                segment_init_valid_len.append(step_state.valid_len)
-                segment_init_pos.append(step_state.pos)
+                segment_init_states[step // args.segment_length] = clone_state(state_for_step)
+            log_prob, action, value, state = sample_action(
+                model,
+                obs,
+                state_for_step,
+                jnp.zeros((args.num_envs,), dtype=jnp.float32),
+                rngs,
+            )
 
-            log_prob, action, value, state = sample_action(model, obs, step_state, done, rngs)
-            env_action = to_env_actions(action, is_discrete=is_discrete)
-            next_obs, reward, terminated, truncated, info = envs.step(env_action)
+            next_obs, reward, terminated, truncated, info = envs.step(np.asarray(action))
             next_done = np.maximum(terminated, truncated).astype(np.float32)
 
             replay.add(obs, action, log_prob, reward, done, value)
             global_env_step += args.num_envs
 
-            if "_episode" in info and "episode" in info:
-                finished = np.asarray(info["_episode"], dtype=bool)
-                for i in np.where(finished)[0]:
-                    rollout_rewards.append(float(info["episode"]["r"][i]))
-                    rollout_lengths.append(int(info["episode"]["l"][i]))
+            if "_episode" in info:
+                for i, finished in enumerate(info["_episode"]):
+                    if finished:
+                        rollout_rewards.append(float(info["episode"]["r"][i]))
+                        rollout_lengths.append(int(info["episode"]["l"][i]))
 
             obs = next_obs
             done = next_done
 
-        num_segments = args.num_steps // args.segment_length
-        if len(segment_init_memory) != num_segments:
-            raise ValueError(
-                f"segment init states mismatch: expected {num_segments}, got {len(segment_init_memory)}"
-            )
-        segment_init_state = TrXLState(
-            memory=jnp.stack(segment_init_memory, axis=0),
-            valid_len=jnp.stack(segment_init_valid_len, axis=0),
-            pos=jnp.stack(segment_init_pos, axis=0),
-        )
-
         obs_batch, actions_batch, log_probs_batch, rewards_batch, dones_batch, values_batch = replay.as_jax()
 
-        next_value = bootstrap_value(model, obs, state, done)
+        bootstrap_state = reset_done_in_state(state, done)
+        next_value = bootstrap_value(model, obs, bootstrap_state, jnp.zeros((args.num_envs,), dtype=jnp.float32))
         advantages, returns = calculate_gae(
             rewards_batch,
             values_batch,
@@ -683,12 +717,14 @@ def main():
             advantages,
             returns,
         )
+        if any(s is None for s in segment_init_states):
+            raise ValueError("Some segment initial states were not captured during rollout.")
 
         for _ in range(args.num_epochs):
             env_indices = np.asarray(jax.random.permutation(rngs(), args.num_envs))
             minibatches = make_minibatches(
                 train_batch,
-                segment_init_state,
+                segment_init_states,
                 env_indices[: args.num_minibatch * envs_per_batch],
                 envs_per_batch,
                 args.segment_length,

@@ -158,10 +158,9 @@ def reset_done_in_state(state, done_mask):
     if done_mask.ndim != 1:
         raise ValueError(f"`done_mask` must be rank-1 [num_envs], got shape={tuple(done_mask.shape)}")
 
-    keep = ~done_mask
-    state.memory = state.memory * keep.view(-1, 1, 1, 1)
-    state.valid_len = state.valid_len * keep.long()
-    state.pos = state.pos * keep.long()
+    state.memory[done_mask] = 0
+    state.valid_len[done_mask] = 0
+    state.pos[done_mask] = 0
     return state
 
 
@@ -469,7 +468,7 @@ class Agent(nn.Module):
 
     def evaluate_segment(self, obs_seq, actions_seq, dones_seq, init_state, max_episode_steps):
         seq_len, batch_size = obs_seq.shape[0], obs_seq.shape[1]
-        state = clone_trxl_state(init_state, device=obs_seq.device)
+        state = init_state
         attn_mask = build_parallel_eval_metadata(dones_seq, state, state.memory.shape[1], max_episode_steps)
 
         obs_flat = obs_seq.reshape(seq_len * batch_size, *obs_seq.shape[2:])
@@ -596,7 +595,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 rollout_state = reset_done_in_state(rollout_state, next_done.bool())
                 if step % args.segment_length == 0:
-                    segment_init_states[step // args.segment_length] = clone_trxl_state(rollout_state, device="cpu")
+                    segment_init_states[step // args.segment_length] = clone_trxl_state(rollout_state, device=device)
 
                 obs[step] = next_obs
                 dones[step] = next_done
@@ -680,9 +679,9 @@ if __name__ == "__main__":
                     mb_old_values = segment_old_values[seg_id, :, env_ids]
                     seg_state = segment_init_states[seg_id]
                     mb_init_state = TrXLState(
-                        memory=seg_state.memory[env_ids_cpu].to(device),
-                        valid_len=seg_state.valid_len[env_ids_cpu].to(device),
-                        pos=seg_state.pos[env_ids_cpu].to(device),
+                        memory=seg_state.memory[env_ids],
+                        valid_len=seg_state.valid_len[env_ids],
+                        pos=seg_state.pos[env_ids],
                     )
 
                     newlogprob, entropy, newvalue = evaluate_segment(
